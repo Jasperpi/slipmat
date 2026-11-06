@@ -182,8 +182,14 @@ async fn load_one(session: &librespot_core::Session, q: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn fake_ddj() -> Result<()> {
+    Err(anyhow!("--fake-ddj needs virtual MIDI ports, which only Linux and macOS have"))
+}
+
 /// Pretend to be a DDJ-FLX4 (virtual MIDI ports), for testing the mapping
 /// against a running Slipmat without the hardware.
+#[cfg(unix)]
 fn fake_ddj() -> Result<()> {
     use midir::os::unix::{VirtualInput, VirtualOutput};
     use std::sync::{Arc, Mutex};

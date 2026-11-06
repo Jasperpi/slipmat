@@ -47,7 +47,8 @@ strip = true
 
 # On Windows, stems can run on the graphics card through DirectML.
 [target.'cfg(windows)'.dependencies]
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "directml"] }
+# copy-dylibs puts DirectML.dll beside the built slipmat.exe, where it must be.
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "directml", "copy-dylibs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Only to quiet ALSA's console chatter about devices this machine lacks.

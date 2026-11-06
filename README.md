@@ -9,12 +9,31 @@ slipmat --no-open    # start without opening a browser
 slipmat doctor       # list sound cards and MIDI ports, check the Spotify login
 slipmat doctor --load "song|other song"   # decode + analyse songs, silently
 slipmat doctor --fake-ddj                 # pretend to be a DDJ-FLX4 (virtual MIDI) for testing
-slipmat doctor --stems clip.f32           # split raw f32 stereo audio into stems, time it
+slipmat doctor --stems clip.f32 [--model demucs]   # split raw f32 stereo audio into stems, time it
 ```
 
 Needs Spotify Premium. Slipmat signs in once (or reuses riff's login on the
 same machine) and is not a Spotify Connect device: it never touches what the
 account is playing elsewhere.
+
+## On Windows
+
+Slipmat builds and runs on Windows too (type-checked for
+`x86_64-pc-windows-msvc`; not yet run on a real Windows machine).
+
+1. Install Rust from <https://rustup.rs> (take the default; it offers the
+   Visual Studio C++ build tools it needs).
+2. Get this folder onto the PC (`git clone`), then in it run
+   `powershell -ExecutionPolicy Bypass -File scripts\windows-install.ps1`.
+   It builds Slipmat (a few minutes) and adds Start menu and desktop
+   shortcuts. Closing Slipmat's console window quits it.
+   Alternatively, once the code is on GitHub, the *Windows build* action
+   produces a ready-made zip (`slipmat.exe` + `DirectML.dll`).
+
+On a 16 GB PC, stems use Demucs automatically, on the graphics card through
+DirectML. Close rekordbox before starting Slipmat: on Windows only one app can
+use the controller's MIDI at a time. If the sound pill says "no cue out",
+set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
 
 ## What it does
 
@@ -33,13 +52,14 @@ account is playing elsewhere.
   BPM ±0.05, ×2, /2). Everything is remembered per song in
   `~/.local/share/slipmat/tracks/`.
 - **Stems**: every song is split into vocals, melody, bass and drums as it
-  loads (about 10 s per song, on this machine, offline). Drop the drums out
+  loads, offline. *Fast* is Spleeter (about 10 s a song, 400 MB); *Best* is
+  Meta's HT-Demucs (much cleaner, about 1 GB, on the GPU on Windows);
+  *Automatic* picks Demucs on computers with 12 GB or more. Drop the drums out
   of one song to bring in the next one's, or play an acapella. Uses Deezer's
   Spleeter 4-stem networks (Apache-2.0, via ONNX Runtime; ~80 MB, downloaded
   to `~/.cache/slipmat/models/` on first use). The stems add back up to the
   original exactly, so with every stem up you hear the untouched song.
-  Stems live in memory only. Meta's Demucs separates better but needs over
-  a gigabyte of free memory per song, more than this laptop has spare.
+  Stems live in memory only.
 - **Sync**: tempo and beat phase, held together while both play; moving a
   synced deck's tempo moves the shared tempo.
 - **Mixer**: trim, 3-band isolator EQ (full kill), one-knob filter, channel

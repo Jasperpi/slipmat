@@ -1,0 +1,26 @@
+# Builds a ready-to-run Windows zip (slipmat.exe + DirectML.dll) on every push
+# to main; download it from the run's "Artifacts" section.
+name: Windows build
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force slipmat | Out-Null
+          Copy-Item target\release\slipmat.exe slipmat\
+          Copy-Item target\release\DirectML.dll slipmat\ -ErrorAction SilentlyContinue
+          Copy-Item README.md slipmat\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slipmat-windows
+          path: slipmat

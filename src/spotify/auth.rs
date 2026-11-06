@@ -67,10 +67,18 @@ fn random_url_safe(n: usize) -> String {
 }
 
 pub fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
-    std::process::Command::new(opener)
-        .arg(url)
-        .stdin(std::process::Stdio::null())
+    let mut cmd = if cfg!(target_os = "windows") {
+        // Not `cmd /C start`: cmd would read the `&`s in a sign-in URL as
+        // command separators. This hands the URL to the default browser as is.
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler").arg(url);
+        c
+    } else {
+        let mut c = std::process::Command::new(if cfg!(target_os = "macos") { "open" } else { "xdg-open" });
+        c.arg(url);
+        c
+    };
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

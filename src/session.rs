@@ -47,6 +47,7 @@ fn riff_credentials() -> Option<PathBuf> {
 }
 
 fn keep_private(dir: &Path) {
+    let _ = dir; // Windows: the user's profile folder is private already
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
