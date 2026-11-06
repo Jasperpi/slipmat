@@ -9,6 +9,7 @@ slipmat --no-open    # start without opening a browser
 slipmat doctor       # list sound cards and MIDI ports, check the Spotify login
 slipmat doctor --load "song|other song"   # decode + analyse songs, silently
 slipmat doctor --fake-ddj                 # pretend to be a DDJ-FLX4 (virtual MIDI) for testing
+slipmat doctor --stems clip.f32           # split raw f32 stereo audio into stems, time it
 ```
 
 Needs Spotify Premium. Slipmat signs in once (or reuses riff's login on the
@@ -31,6 +32,14 @@ account is playing elsewhere.
   auto gain, auto cue on the first beat. Grid fixes per deck (nudge, set beat 1,
   BPM ±0.05, ×2, /2). Everything is remembered per song in
   `~/.local/share/slipmat/tracks/`.
+- **Stems**: every song is split into vocals, melody, bass and drums as it
+  loads (about 10 s per song, on this machine, offline). Drop the drums out
+  of one song to bring in the next one's, or play an acapella. Uses Deezer's
+  Spleeter 4-stem networks (Apache-2.0, via ONNX Runtime; ~80 MB, downloaded
+  to `~/.cache/slipmat/models/` on first use). The stems add back up to the
+  original exactly, so with every stem up you hear the untouched song.
+  Stems live in memory only. Meta's Demucs separates better but needs over
+  a gigabyte of free memory per song, more than this laptop has spare.
 - **Sync**: tempo and beat phase, held together while both play; moving a
   synced deck's tempo moves the shared tempo.
 - **Mixer**: trim, 3-band isolator EQ (full kill), one-knob filter, channel
@@ -59,12 +68,13 @@ account is playing elsewhere.
 | SHIFT + CUE/LOOP CALL | jump 16 beats |
 | Pads: HOT CUE, BEAT LOOP, BEAT JUMP, PAD FX1/2 | hot cues (SHIFT deletes), auto loops, jumps, held effects |
 | Headphone CUE / SHIFT + CUE | headphone cue / key lock |
+| SHIFT + HOT CUE (keyboard mode) pads | stems: 1-4 vocals/melody/bass/drums on-off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all back |
 | BEAT FX section | effect unit 1: select, beat ◀ ▶, channel, level, on/off |
 | Browse knob, push, LOAD 1/2 | move in the list, switch playlists/songs, load |
 
 ## Not yet
 
-Sampler pads, key shift pads, stems, more than two decks, recording (Spotify
+Sampler pads, key shift pads, stem effects, more than two decks, recording (Spotify
 doesn't allow recording its streams; Serato blocks it too), MIDI learn for
 other controllers.
 
@@ -74,6 +84,7 @@ other controllers.
   (`mod.rs`), filters (`dsp.rs`), effects (`fx.rs`), sound card (`output.rs`)
 - `src/loader.rs` decodes a Spotify song into memory with librespot
 - `src/analysis.rs` tempo, grid, key, loudness
+- `src/stems.rs` stem separation (STFT → four networks → masks → iSTFT, in 12 s pieces)
 - `src/midi.rs` the controller mapping and lights
 - `src/server.rs`, `src/app.rs` the local web server and shared state
 - `src/spotify/` sign-in, library and metadata, shared with riff

@@ -46,6 +46,24 @@ impl PadMode {
 const ALL_MODES: [PadMode; 8] =
     [PadMode::HotCue, PadMode::Keyboard, PadMode::PadFx1, PadMode::PadFx2, PadMode::BeatJump, PadMode::BeatLoop, PadMode::Sampler, PadMode::KeyShift];
 
+/// The KEYBOARD pad mode (SHIFT + HOT CUE) plays the stems: pads 1-4 turn
+/// vocals, melody, bass and drums on and off (SHIFT: solo), pads 5-8 are
+/// acapella, instrumental, no drums, and everything back.
+const STEM_PRESETS: [[f32; 4]; 4] = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 0.0], [1.0; 4]];
+
+fn stem_pad(now: [f32; 4], n: usize, shift: bool) -> [f32; 4] {
+    if n >= 4 {
+        return STEM_PRESETS[n - 4];
+    }
+    let mut g = now;
+    if shift {
+        let solo: [f32; 4] = std::array::from_fn(|k| if k == n { 1.0 } else { 0.0 });
+        return if now == solo { [1.0; 4] } else { solo };
+    }
+    g[n] = if now[n] > 0.5 { 0.0 } else { 1.0 };
+    g
+}
+
 const LOOP_BEATS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const JUMP_BEATS: [f64; 8] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
 const RANGES: [f32; 4] = [0.06, 0.10, 0.16, 0.50];
@@ -295,6 +313,10 @@ impl Mapper {
                     }
                     0x00 => out.push(c(Control::Hotcue { d, n, down })),
                     0x60 if down => out.push(c(Control::AutoLoop { d, beats: LOOP_BEATS[n] })),
+                    0x40 if down => {
+                        let now = st.decks.get(d).map_or([1.0; 4], |s| s.stems);
+                        out.push(c(Control::Stems { d, gains: stem_pad(now, n, shift) }));
+                    }
                     0x20 if down && !shift => out.push(c(Control::BeatJump { d, beats: JUMP_BEATS[n] })),
                     0x10 | 0x50 => {
                         let (kind, beats) = if base == 0x10 { PAD_FX1[n] } else { PAD_FX2[n] };
@@ -354,6 +376,8 @@ impl Mapper {
                     };
                     l.insert((pads, 0x60 + i), on(lit));
                     l.insert((pads, 0x20 + i), on(s.loaded));
+                    let stem_lit = if i < 4 { s.stems[i as usize] > 0.5 } else { s.stems == STEM_PRESETS[i as usize - 4] };
+                    l.insert((pads, 0x40 + i), on(s.loaded && stem_lit));
                     let held = |base: u8| self.pad_fx.as_ref().is_some_and(|p| p.0 == d && p.1 == base + i);
                     l.insert((pads, 0x10 + i), on(held(0x10)));
                     l.insert((pads, 0x50 + i), on(held(0x50)));
@@ -511,7 +535,8 @@ mod tests {
     use crate::engine::DeckState;
 
     fn state() -> State {
-        State { decks: vec![DeckState::default(), DeckState::default()], fx: vec![Default::default(), Default::default()], ..Default::default() }
+        let deck = DeckState { stems: [1.0; 4], ..Default::default() };
+        State { decks: vec![deck.clone(), deck], fx: vec![Default::default(), Default::default()], ..Default::default() }
     }
 
     fn ctl(m: &mut Mapper, msg: &[u8], st: &State) -> Vec<String> {
@@ -533,6 +558,10 @@ mod tests {
         assert_eq!(ctl(&mut m, &[0x99, 0x64, 0x7F], &st), ["AutoLoop { d: 1, beats: 4.0 }"]);
         assert_eq!(ctl(&mut m, &[0x97, 0x27, 0x7F], &st), ["BeatJump { d: 0, beats: 8.0 }"]);
         assert_eq!(ctl(&mut m, &[0x96, 0x47, 0x7F], &st), ["LoadSelected { d: 1 }"]);
+        // Stems: pad 4 in KEYBOARD mode drops the drums, SHIFT + pad 1 solos vocals.
+        assert_eq!(ctl(&mut m, &[0x97, 0x43, 0x7F], &st), ["Stems { d: 0, gains: [1.0, 1.0, 1.0, 0.0] }"]);
+        assert_eq!(ctl(&mut m, &[0x98, 0x40, 0x7F], &st), ["Stems { d: 0, gains: [1.0, 0.0, 0.0, 0.0] }"]);
+        assert_eq!(ctl(&mut m, &[0x99, 0x45, 0x7F], &st), ["Stems { d: 1, gains: [0.0, 1.0, 1.0, 1.0] }"]);
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub async fn run(args: &[String]) -> Result<()> {
     if let Some(q) = value(args, "--load") {
         return load(q).await;
     }
+    if let Some(f) = value(args, "--stems") {
+        return stems_file(f);
+    }
     if args.iter().any(|a| a == "--fake-ddj") {
         return fake_ddj();
     }
@@ -124,6 +127,17 @@ async fn load_one(session: &librespot_core::Session, q: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let took = started.elapsed();
+    // SLIPMAT_DUMP=file.f32 saves 30 s from the one-minute mark (raw f32 stereo) for offline tests.
+    if let Some(path) = std::env::var_os("SLIPMAT_DUMP") {
+        let len = audio.len();
+        let mut bytes = Vec::new();
+        for i in (SRC_RATE as usize * 60)..(SRC_RATE as usize * 90).min(len) {
+            let (l, r) = audio.frame(i, len);
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        std::fs::write(&path, bytes)?;
+    }
     let secs = audio.len() as f64 / SRC_RATE;
     println!(
         "{G} decoded {secs:.1} s of audio in {:.1} s ({:.0}× real time); first second playable after {:.2} s",
@@ -218,5 +232,35 @@ fn fake_ddj() -> Result<()> {
     let find = |s: u8, d: u8| got.iter().rev().find(|m| m[0] == s && m[1] == d).map(|m| m[2]);
     println!("  play deck 1: {:?}  hot cue pad 1: {:?}  4-beat loop pad: {:?}  headphone cue: {:?}  VU deck 1: {:?}",
         find(0x90, 0x0B), find(0x97, 0x00), find(0x97, 0x64), find(0x90, 0x54), find(0xB0, 0x02));
+    Ok(())
+}
+
+/// Separate a raw f32 stereo file and, if `ref_<stem>.f32` files from the
+/// Python reference sit beside it, report how far apart the two are.
+fn stems_file(path: &str) -> Result<()> {
+    use crate::stems::{Stems, separate};
+    use crate::track::TrackAudio;
+    let bytes = std::fs::read(path)?;
+    let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+    let frames = samples.len() / 2;
+    let track = TrackAudio::new((frames as f64 / SRC_RATE * 1000.0) as u32);
+    track.push(&samples);
+    track.done.store(true, std::sync::atomic::Ordering::Release);
+    let stems = Stems::for_track(&track);
+    let t = Instant::now();
+    separate(&track, &stems)?;
+    println!("{G} separated {:.1} s of audio in {:.2} s", frames as f64 / SRC_RATE, t.elapsed().as_secs_f64());
+    let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+    for (k, name) in ["vocals", "drums", "bass"].iter().enumerate() {
+        let Ok(r) = std::fs::read(dir.join(format!("ref_{name}.f32"))) else { continue };
+        let reference: Vec<f32> = r.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        let (mut err, mut sig) = (0.0f64, 0.0f64);
+        for i in 0..frames.min(reference.len() / 2) {
+            let (l, rr) = stems.frame(k, i);
+            err += ((l - reference[2 * i]) as f64).powi(2) + ((rr - reference[2 * i + 1]) as f64).powi(2);
+            sig += (reference[2 * i] as f64).powi(2) + (reference[2 * i + 1] as f64).powi(2);
+        }
+        println!("  {name}: differs from the Python reference by {:.1} dB", 10.0 * (err / sig.max(1e-12)).log10());
+    }
     Ok(())
 }

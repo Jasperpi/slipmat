@@ -21,6 +21,8 @@ pub struct Settings {
     pub vinyl: bool,
     /// Show keys as Camelot codes (8A) instead of names (Am).
     pub camelot: bool,
+    /// Split every song into vocals, melody, bass and drums when it loads.
+    pub stems: bool,
 }
 
 impl Default for Settings {
@@ -34,6 +36,7 @@ impl Default for Settings {
             auto_gain: true,
             vinyl: true,
             camelot: true,
+            stems: true,
         }
     }
 }

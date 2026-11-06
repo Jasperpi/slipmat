@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use serde::{Deserialize, Serialize};
 
+use crate::stems::Stems;
 use crate::track::{SRC_RATE, TrackAudio};
 
 pub const HOTCUES: usize = 8;
@@ -85,6 +86,13 @@ const GRAIN: usize = 1024; // half a grain (hop), output frames
 
 pub struct Deck {
     pub track: Option<Arc<TrackAudio>>,
+    /// The song split into vocals, melody, bass and drums, as far as done.
+    pub stems: Option<Arc<Stems>>,
+    /// Level of each stem asked for (vocals, melody, bass, drums), 0..1.
+    pub stem_gain: [f32; 4],
+    /// Level of each stem as heard, gliding to `stem_gain`.
+    stem_now: [f32; 4],
+    stems_ready: usize,
     pub grid: Option<Grid>,
     pub pos: f64,
     /// Asked for by the user.
@@ -129,6 +137,10 @@ impl Default for Deck {
     fn default() -> Self {
         Self {
             track: None,
+            stems: None,
+            stem_gain: [1.0; 4],
+            stem_now: [1.0; 4],
+            stems_ready: 0,
             grid: None,
             pos: 0.0,
             playing: false,
@@ -189,10 +201,18 @@ impl Deck {
         (self.pos - self.cue).abs() < 2.0
     }
 
-    pub fn load(&mut self, track: Arc<TrackAudio>, grid: Option<Grid>, cue: f64, hotcues: [Option<f64>; HOTCUES]) -> Option<Arc<TrackAudio>> {
-        let old = self.track.replace(track);
+    /// Put a song on the deck; returns what was there, to be freed elsewhere.
+    pub fn load(
+        &mut self,
+        track: Arc<TrackAudio>,
+        stems: Option<Arc<Stems>>,
+        grid: Option<Grid>,
+        cue: f64,
+        hotcues: [Option<f64>; HOTCUES],
+    ) -> (Option<Arc<TrackAudio>>, Option<Arc<Stems>>) {
+        let old = (self.track.replace(track), std::mem::replace(&mut self.stems, stems));
         let keep = (self.pitch, self.range, self.keylock, self.slip);
-        *self = Self { track: self.track.take(), ..Self::default() };
+        *self = Self { track: self.track.take(), stems: self.stems.take(), ..Self::default() };
         (self.pitch, self.range, self.keylock, self.slip) = keep;
         self.tempo = self.own_tempo();
         self.grid = grid;
@@ -202,8 +222,8 @@ impl Deck {
         old
     }
 
-    pub fn eject(&mut self) -> Option<Arc<TrackAudio>> {
-        let old = self.track.take();
+    pub fn eject(&mut self) -> (Option<Arc<TrackAudio>>, Option<Arc<Stems>>) {
+        let old = (self.track.take(), self.stems.take());
         let keep = (self.pitch, self.range, self.keylock, self.slip);
         *self = Self::default();
         (self.pitch, self.range, self.keylock, self.slip) = keep;
@@ -522,7 +542,27 @@ impl Deck {
                 i = s + (i - e) % (e - s);
             }
         }
-        if i < 0 { (0.0, 0.0) } else { track.frame(i as usize, len) }
+        if i < 0 {
+            return (0.0, 0.0);
+        }
+        let i = i as usize;
+        let (l, r) = track.frame(i, len);
+        // With a stem turned down, take it (scaled) out of the song. The
+        // melody is the song minus the other three, so with every gain g:
+        // out = g_mel·song + Σ (g_s − g_mel)·stem_s over vocals, drums, bass.
+        if self.stem_now != [1.0; 4] && i < self.stems_ready && i < len {
+            if let Some(st) = self.stems.as_ref() {
+                let [gv, gm, gb, gd] = self.stem_now;
+                let (vl, vr) = st.frame(0, i);
+                let (dl, dr) = st.frame(1, i);
+                let (bl, br) = st.frame(2, i);
+                return (
+                    gm * l + (gv - gm) * vl + (gd - gm) * dl + (gb - gm) * bl,
+                    gm * r + (gv - gm) * vr + (gd - gm) * dr + (gb - gm) * br,
+                );
+            }
+        }
+        (l, r)
     }
 
     #[inline]
@@ -632,6 +672,9 @@ impl Deck {
         let done = track.done.load(Ordering::Acquire);
         let ratio = SRC_RATE / rate;
         self.last_ratio = ratio;
+        self.stems_ready = self.stems.as_ref().map_or(0, |s| s.ready());
+        // Stem levels glide over about 5 ms, so muting one never clicks.
+        let stem_step = (1.0 / (0.005 * rate)) as f32;
         let sub = 64;
         let dt = sub as f64 / rate;
         // Start the motor at once; stop it only after fading out.
@@ -646,6 +689,12 @@ impl Deck {
                     self.speed += (target - self.speed) * (1.0 - (-dt / 0.03).exp());
                 } else {
                     self.speed = target;
+                }
+            }
+            if self.stem_now != self.stem_gain {
+                for k in 0..4 {
+                    let d = self.stem_gain[k] - self.stem_now[k];
+                    self.stem_now[k] += d.clamp(-stem_step, stem_step);
                 }
             }
             let want = if self.playing || self.scratch.is_some() { 1.0 } else { 0.0 };
@@ -756,7 +805,7 @@ mod tests {
     #[test]
     fn plays_at_tempo_and_output_rate() {
         let mut d = Deck::default();
-        d.load(tone_track(10.0), None, 0.0, [None; 8]);
+        d.load(tone_track(10.0), None, None, 0.0, [None; 8]);
         d.play();
         run(&mut d, 1.0, 48_000.0);
         assert!((d.pos - SRC_RATE).abs() < 600.0, "{}", d.pos);
@@ -770,7 +819,7 @@ mod tests {
     #[test]
     fn cdj_cue_behaviour() {
         let mut d = Deck::default();
-        d.load(tone_track(20.0), None, 0.0, [None; 8]);
+        d.load(tone_track(20.0), None, None, 0.0, [None; 8]);
         d.jump(SRC_RATE * 2.0);
         // Paused away from cue: CUE sets the cue here.
         d.cue_button(true, false);
@@ -798,7 +847,7 @@ mod tests {
     fn hotcues_and_loops_on_the_grid() {
         let mut d = Deck::default();
         let grid = Grid { bpm: 120.0, anchor: 0.0 };
-        d.load(tone_track(30.0), Some(grid), 0.0, [None; 8]);
+        d.load(tone_track(30.0), None, Some(grid), 0.0, [None; 8]);
         d.jump(grid.period() * 4.0 + 300.0);
         d.hotcue(0, true, true);
         d.hotcue(0, false, true);
@@ -824,7 +873,7 @@ mod tests {
     #[test]
     fn scratch_follows_the_platter() {
         let mut d = Deck::default();
-        d.load(tone_track(10.0), None, 0.0, [None; 8]);
+        d.load(tone_track(10.0), None, None, 0.0, [None; 8]);
         d.jump(SRC_RATE * 3.0);
         d.jog_touch(true);
         let start = d.pos;
@@ -842,9 +891,43 @@ mod tests {
     }
 
     #[test]
+    fn dropping_a_stem_takes_out_just_that_part() {
+        // A song made of four tones; each "stem" is one of them.
+        let hz = [220.0f32, 330.0, 55.0, 1_000.0]; // vocals, melody, bass, drums
+        let tone = |k: usize, i: usize| (i as f32 * 2.0 * std::f32::consts::PI * hz[k] / 44_100.0).sin() * 0.2;
+        let secs = 3.0;
+        let n = (secs * SRC_RATE) as usize;
+        let t = TrackAudio::new((secs * 1000.0) as u32);
+        let song: Vec<f32> = (0..n).flat_map(|i| {
+            let v: f32 = (0..4).map(|k| tone(k, i)).sum();
+            [v, v]
+        }).collect();
+        t.push(&song);
+        t.done.store(true, Ordering::Release);
+        let t = Arc::new(t);
+        let (v, dr, b) = (|i: usize| (tone(0, i), tone(0, i)), |i: usize| (tone(3, i), tone(3, i)), |i: usize| (tone(2, i), tone(2, i)));
+        let stems = Arc::new(Stems::filled(&t, [&v, &dr, &b]));
+        let mut d = Deck::default();
+        d.load(t.clone(), Some(stems), None, 0.0, [None; 8]);
+        d.stem_gain = [1.0, 1.0, 1.0, 0.0]; // no drums
+        d.play();
+        let out = run(&mut d, 1.0, 44_100.0);
+        // After the glide, the output is the song without the 1 kHz tone.
+        let start = d.pos as usize - 22_050;
+        let frames = &out[out.len() - 2 * 22_050..];
+        let mut err = 0.0f32;
+        for (j, f) in frames.chunks(2).enumerate() {
+            let i = start + j;
+            let want = tone(0, i) + tone(1, i) + tone(2, i);
+            err = err.max((f[0] - want).abs());
+        }
+        assert!(err < 0.002, "residual {err}");
+    }
+
+    #[test]
     fn key_lock_keeps_time_and_stays_clean() {
         let mut d = Deck::default();
-        d.load(tone_track(20.0), None, 0.0, [None; 8]);
+        d.load(tone_track(20.0), None, None, 0.0, [None; 8]);
         d.keylock = true;
         d.pitch = 0.75; // +6%
         d.tempo = d.own_tempo();

@@ -15,6 +15,7 @@ use deck::{Deck, Grid, HOTCUES, Loop};
 use dsp::{Curve, Isolator, Limiter, Meter, SweepFilter};
 use fx::{FxKind, Unit};
 
+use crate::stems::{self, Stems};
 use crate::track::{SRC_RATE, TrackAudio};
 
 pub const DECKS: usize = 2;
@@ -74,11 +75,24 @@ pub enum Control {
     GridBpm { d: usize, bpm: f64 },
     Eject { d: usize },
     AutoGain { on: bool },
+    /// Levels of vocals, melody, bass and drums on deck `d`, 0..1 each.
+    Stems { d: usize, gains: [f32; 4] },
 }
+
+/// A song taken off a deck, on its way to be freed off the audio thread.
+pub struct Garbage(#[allow(dead_code)] Option<Arc<TrackAudio>>, #[allow(dead_code)] Option<Arc<Stems>>);
 
 pub enum Cmd {
     Control(Control),
-    Load { d: usize, track: Arc<TrackAudio>, grid: Option<Grid>, cue: f64, hotcues: [Option<f64>; HOTCUES], gain_db: f32 },
+    Load {
+        d: usize,
+        track: Arc<TrackAudio>,
+        stems: Option<Arc<Stems>>,
+        grid: Option<Grid>,
+        cue: f64,
+        hotcues: [Option<f64>; HOTCUES],
+        gain_db: f32,
+    },
     /// Analysis finished for the song now on deck `d` (ignored if it changed).
     Analysed { d: usize, track: Arc<TrackAudio>, grid: Grid, cue: Option<f64>, gain_db: f32 },
 }
@@ -150,6 +164,10 @@ pub struct DeckState {
     pub side: i8,
     pub auto_db: f32,
     pub meter: [f32; 2],
+    pub stems: [f32; 4],
+    /// Frames separated into stems so far, and how that is going.
+    pub stems_ready: f64,
+    pub stems_status: Option<stems::Status>,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -199,7 +217,7 @@ pub struct Engine {
     clock: f64,
     since_publish: f64,
     rx: Receiver<Cmd>,
-    trash: Sender<Arc<TrackAudio>>,
+    trash: Sender<Garbage>,
     state: Arc<Mutex<State>>,
     bufs: Vec<Vec<f32>>,
 }
@@ -221,7 +239,7 @@ impl Handle {
 }
 
 impl Engine {
-    pub fn new(rate: f64) -> (Self, Handle, Receiver<Arc<TrackAudio>>) {
+    pub fn new(rate: f64) -> (Self, Handle, Receiver<Garbage>) {
         let (tx, rx) = crossbeam_channel::unbounded();
         let (trash, garbage) = crossbeam_channel::unbounded();
         let state = Arc::new(Mutex::new(State::default()));
@@ -275,10 +293,13 @@ impl Engine {
         self.limiter = Limiter::new(r);
     }
 
-    fn discard(&self, t: Option<Arc<TrackAudio>>) {
-        if let Some(t) = t {
-            let _ = self.trash.send(t);
+    /// Hand a song (and its stems) to another thread to free: freeing a
+    /// few hundred megabytes here would stall the sound card.
+    fn discard(&self, (track, stems): (Option<Arc<TrackAudio>>, Option<Arc<Stems>>)) {
+        if let Some(s) = stems.as_ref() {
+            s.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
+        let _ = self.trash.send(Garbage(track, stems));
     }
 
     fn other(d: usize) -> usize {
@@ -485,11 +506,12 @@ impl Engine {
                     None => deck.grid = Some(Grid { bpm, anchor: deck.pos }),
                 }
             }
-            Eject { d } if ok(d) => {
+            Eject { d } if ok(d) && !self.decks[d].playing => {
                 let old = self.decks[d].eject();
                 self.discard(old);
             }
             AutoGain { on } => self.auto_gain = on,
+            Stems { d, gains } if ok(d) => self.decks[d].stem_gain = gains.map(|g| g.clamp(0.0, 1.0)),
             _ => {}
         }
     }
@@ -497,12 +519,12 @@ impl Engine {
     fn command(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Control(c) => self.control(c),
-            Cmd::Load { d, track, grid, cue, hotcues, gain_db } if d < DECKS => {
+            Cmd::Load { d, track, stems, grid, cue, hotcues, gain_db } if d < DECKS => {
                 if self.decks[d].playing {
                     return; // never swap the song out from under a playing deck
                 }
                 let was_synced = self.decks[d].sync;
-                let old = self.decks[d].load(track, grid, cue, hotcues);
+                let old = self.decks[d].load(track, stems, grid, cue, hotcues);
                 self.strips[d].auto_db = gain_db;
                 self.discard(old);
                 if was_synced {
@@ -685,6 +707,9 @@ impl Engine {
                 pfl: s.pfl,
                 side: s.side,
                 auto_db: s.auto_db,
+                stems: deck.stem_gain,
+                stems_ready: deck.stems.as_ref().map_or(0.0, |s| s.ready() as f64),
+                stems_status: deck.stems.as_ref().map(|s| s.status()),
                 meter: [s.meter[0].level, s.meter[1].level],
             };
         }
@@ -745,8 +770,8 @@ mod tests {
         let b = click_track(120.0, 60.0);
         let ga = Grid { bpm: 124.0, anchor: 0.0 };
         let gb = Grid { bpm: 120.0, anchor: 0.0 };
-        h.tx.send(Cmd::Load { d: 0, track: a, grid: Some(ga), cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
-        h.tx.send(Cmd::Load { d: 1, track: b, grid: Some(gb), cue: 1234.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 0, track: a, stems: None, grid: Some(ga), cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 1, track: b, stems: None, grid: Some(gb), cue: 1234.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
         h.send(Control::Play { d: 0 });
         render(&mut e, 2.3);
         h.send(Control::Sync { d: 1, on: Some(true) });
@@ -770,7 +795,7 @@ mod tests {
     #[test]
     fn crossfader_and_cue_routing() {
         let (mut e, h, _g) = Engine::new(44_100.0);
-        h.tx.send(Cmd::Load { d: 0, track: click_track(120.0, 10.0), grid: None, cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 0, track: click_track(120.0, 10.0), stems: None, grid: None, cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
         h.send(Control::Play { d: 0 });
         h.send(Control::Crossfader { v: 1.0 });
         h.send(Control::Curve { curve: Curve::Sharp });

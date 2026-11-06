@@ -12,6 +12,8 @@ const FX_BEATS = ['1/8', '1/4', '1/2', '3/4', '1', '2', '4', '8', '16'];
 const LOOPS = [[0.25, '¼'], [0.5, '½'], [1, '1'], [2, '2'], [4, '4'], [8, '8'], [16, '16']];
 const JUMPS = [1, 2, 4, 8, 16, 32];
 const ZOOMS = [2, 3, 4, 6, 8, 12, 16, 24];
+const STEMS = [['VOX', 'Vocals'], ['MEL', 'Melody'], ['BASS', 'Bass'], ['DRUM', 'Drums']];
+const STEM_COLORS = ['#f472b6', '#facc15', '#60a5fa', '#fb923c'];
 
 const $ = (s, el = document) => el.querySelector(s);
 const S = { engine: null, decks: [null, null], extras: {}, settings: null, zoom: 4, login: null };
@@ -106,6 +108,7 @@ function buildDeck(d) {
         <div class="readout">
           <div class="times"><span class="elapsed">0:00.0</span><span class="remain">-0:00.0</span></div>
           <div class="chips"><span class="chip key">—</span><span class="chip gain" title="Auto gain"></span><div class="beats"><i class="down"></i><i></i><i></i><i></i></div></div>
+          <div class="stems"></div>
           <div class="grid-tools"></div>
         </div>
       </div>
@@ -130,6 +133,32 @@ function buildDeck(d) {
   const reset = btn('0', 'Back to the song’s own tempo', 'xs');
   reset.onclick = () => ctl('pitch_reset', { d });
   $('.pitch-col', root).append(reset);
+
+  // Stems: click to drop one out, right-click (or shift-click) to solo it.
+  const sb = $('.stems', root);
+  ui.stemBtns = STEMS.map(([label, title], k) => {
+    const b = btn(label, `${title} (click: on/off · right-click: solo)`, 'xs stem');
+    b.style.setProperty('--sc', STEM_COLORS[k]);
+    const press = (solo) => {
+      const now = S.engine?.decks[d]?.stems ?? [1, 1, 1, 1];
+      let gains;
+      if (solo) {
+        const only = now.map((_, i) => (i === k ? 1 : 0));
+        gains = now.every((v, i) => v === only[i]) ? [1, 1, 1, 1] : only;
+      } else {
+        gains = now.slice();
+        gains[k] = now[k] > 0.5 ? 0 : 1;
+      }
+      ctl('stems', { d, gains });
+    };
+    b.addEventListener('click', (e) => press(e.shiftKey));
+    b.addEventListener('contextmenu', (e) => { e.preventDefault(); press(true); });
+    sb.append(b);
+    return b;
+  });
+  ui.stemNote = document.createElement('span');
+  ui.stemNote.className = 'stem-note';
+  sb.append(ui.stemNote);
 
   // Beat grid fixes.
   const gt = $('.grid-tools', root);
@@ -698,6 +727,12 @@ function onState(msg) {
     cls(ui.slip, 'on', st.slip);
     cls(ui.platter, 'touched', st.touched);
     ui.pads.forEach((p, n) => cls(p, 'set', st.hotcues[n] != null));
+    // Stems.
+    ui.stemBtns.forEach((b, k) => { cls(b, 'muted', st.stems[k] < 0.5); b.disabled = !st.stems_status; });
+    const ss = st.stems_status;
+    const pctDone = st.len ? Math.min(100, Math.floor(st.stems_ready / st.len * 100)) : 0;
+    setText(ui.stemNote, !st.loaded ? '' : !ss ? 'stems off' : ss === 'done' ? '' : ss === 'downloading' ? 'getting stem models…' : ss === 'failed' ? 'stems failed' : ss === 'separating' ? `splitting ${pctDone}%` : ss === 'waiting' ? 'stems queued' : '');
+    cls(ui.stemNote, 'bad', ss === 'failed');
     const lp = st.loop;
     const period = st.grid ? SRC * 60 / st.grid.bpm : 0;
     ui.loopBtns.forEach(([beats, b]) => cls(b, 'loopon', lp?.active && period && Math.abs(lp.end - lp.start - beats * period) < 2));
@@ -872,6 +907,7 @@ async function openSettings() {
   $('#set-invert').checked = s.invert_tempo;
   $('#set-range').value = String(s.range);
   $('#set-camelot').checked = s.camelot;
+  $('#set-stems').checked = s.stems;
   const login = S.extras.login;
   setText($('#set-account'), login?.state === 'online' ? `Signed in as ${login.user}` : 'Not signed in');
   outputStatus(S.extras.output);
@@ -903,6 +939,7 @@ async function saveSettings() {
   s.invert_tempo = $('#set-invert').checked;
   s.range = +$('#set-range').value;
   s.camelot = $('#set-camelot').checked;
+  s.stems = $('#set-stems').checked;
   useCamelot(s.camelot);
   try {
     const r = await api.post('/api/settings', s);

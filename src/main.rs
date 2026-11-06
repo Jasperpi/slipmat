@@ -12,6 +12,7 @@ mod server;
 mod session;
 mod settings;
 mod spotify;
+mod stems;
 mod store;
 mod track;
 

@@ -17,6 +17,7 @@ use crate::session::Spotify;
 use crate::settings::Settings;
 use crate::spotify::model::Track;
 use crate::spotify::spot;
+use crate::stems::{self, Stems};
 use crate::store::Store;
 use crate::track::TrackAudio;
 use crate::loader;
@@ -247,11 +248,17 @@ impl App {
             bail!("“{}” can't be played here", track.name);
         }
         let audio = loader::load(&session, uri, track.duration_ms)?;
+        // Split into stems in the background, as the song arrives.
+        let stems = self.settings().stems.then(|| {
+            let st = Arc::new(Stems::for_track(&audio));
+            stems::spawn(audio.clone(), st.clone());
+            st
+        });
         let saved = self.store.get(&track.id);
         let grid = saved.grid.or(saved.analysis.as_ref().map(|a| Grid { bpm: a.bpm, anchor: a.anchor }));
         let cue = saved.cue.or(saved.analysis.as_ref().map(auto_cue)).unwrap_or(0.0);
         let gain_db = saved.analysis.as_ref().map(auto_gain).unwrap_or(0.0);
-        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), grid, cue, hotcues: saved.hotcues, gain_db })?;
+        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), stems, grid, cue, hotcues: saved.hotcues, gain_db })?;
         let analysing = saved.analysis.is_none();
         self.decks.lock().unwrap()[d] = Some(OnDeck { track: track.clone(), audio: audio.clone(), analysis: saved.analysis.clone(), analysing });
         let app = self.clone();
@@ -352,6 +359,7 @@ impl App {
     async fn keep_cues(self: Arc<Self>) {
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
+            stems::release_idle();
             let st = self.engine.snapshot();
             let decks = self.decks.lock().unwrap().clone();
             for (d, on) in decks.iter().enumerate() {

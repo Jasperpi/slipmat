@@ -153,6 +153,13 @@ input, select { font: inherit; color: inherit; }
 .beats i.on { background: var(--c); }
 .beats i.down.on { background: #fff; }
 .grid-tools { display: flex; gap: 4px; flex-wrap: wrap; }
+.stems { display: flex; gap: 4px; align-items: center; flex-wrap: wrap; }
+.btn.xs.stem { --sc: #ddd; color: #0c0d0f; background: var(--sc); border-color: var(--sc); font-weight: 700; min-width: 40px; }
+.btn.xs.stem:hover { filter: brightness(1.1); background: var(--sc); }
+.btn.xs.stem.muted { background: var(--panel-2); color: var(--faint); border-color: var(--line-2); text-decoration: line-through; }
+.btn.xs.stem:disabled { opacity: .35; cursor: default; }
+.stem-note { font: 500 10px var(--mono); color: var(--dim); white-space: nowrap; }
+.stem-note.bad { color: var(--bad); }
 
 .btn {
   height: 30px; padding: 0 10px; border-radius: 6px;
