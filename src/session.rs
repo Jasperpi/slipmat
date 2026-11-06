@@ -94,10 +94,6 @@ impl Spotify {
         self.login.subscribe()
     }
 
-    pub fn current(&self) -> Option<Session> {
-        self.live.borrow().clone()
-    }
-
     /// The live session, waiting a little if one is on its way.
     pub async fn session(&self) -> Result<Session> {
         let mut rx = self.live.subscribe();

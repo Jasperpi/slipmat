@@ -78,6 +78,7 @@ pub async fn run(open: bool) -> Result<()> {
         .route("/api/settings", get(settings).post(save_settings))
         .route("/api/devices", get(devices))
         .route("/api/control", post(control))
+        .route("/api/quit", post(quit))
         .layer(middleware::from_fn(local_only))
         .with_state(app.clone());
     println!("Slipmat is running: {url}  (Ctrl-C to quit)");
@@ -232,6 +233,14 @@ async fn save_settings(State(app): State<Shared>, Json(s): Json<Settings>) -> An
 async fn devices() -> Json<Value> {
     let list = tokio::task::spawn_blocking(output::devices).await.unwrap_or_default();
     Json(json!({ "devices": list }))
+}
+
+async fn quit() -> Json<Value> {
+    tokio::spawn(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    Json(json!({ "ok": true }))
 }
 
 async fn control(State(app): State<Shared>, Json(c): Json<Control>) -> Json<Value> {

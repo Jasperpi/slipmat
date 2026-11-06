@@ -18,7 +18,7 @@ use crate::settings::Settings;
 use crate::spotify::model::Track;
 use crate::spotify::spot;
 use crate::store::Store;
-use crate::track::{SRC_RATE, TrackAudio};
+use crate::track::TrackAudio;
 use crate::loader;
 
 /// Loudness every song is brought to when auto gain is on (RMS, dBFS).
@@ -390,9 +390,4 @@ impl App {
         *self.settings.lock().unwrap() = new;
         Ok(())
     }
-}
-
-/// Seconds of song for a position in frames.
-pub fn secs(frames: f64) -> f64 {
-    frames / SRC_RATE
 }

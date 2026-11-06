@@ -41,18 +41,6 @@ impl PadMode {
     fn from_button(n: u8) -> Option<Self> {
         ALL_MODES.iter().copied().find(|m| m.button() == n)
     }
-    fn pads(self) -> u8 {
-        match self {
-            PadMode::HotCue => 0x00,
-            PadMode::PadFx1 => 0x10,
-            PadMode::BeatJump => 0x20,
-            PadMode::Sampler => 0x30,
-            PadMode::Keyboard => 0x40,
-            PadMode::PadFx2 => 0x50,
-            PadMode::BeatLoop => 0x60,
-            PadMode::KeyShift => 0x70,
-        }
-    }
 }
 
 const ALL_MODES: [PadMode; 8] =

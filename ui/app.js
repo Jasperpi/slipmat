@@ -780,7 +780,8 @@ function pills() {
 
 let wasOnline = false;
 function loginOverlay(login) {
-  const show = login.state !== 'online' && login.state !== 'reconnecting';
+  // Not for the second of "connecting" at every start; only when it needs the user.
+  const show = ['signed_out', 'browser', 'failed'].includes(login.state) || (login.state === 'connecting' && !$('#login').hidden);
   $('#login').hidden = !show;
   $('#login-riff').hidden = !(login.state === 'signed_out' && login.riff);
   const status = { connecting: 'Connecting…', browser: 'Waiting for you to approve in the Spotify tab…', failed: login.message, signed_out: '' }[login.state] ?? '';
@@ -920,6 +921,11 @@ document.querySelectorAll('.overlay').forEach((o) => o.addEventListener('click',
 $('#login-browser').onclick = () => api.post('/api/login/browser').catch((e) => toast(e.message, true));
 $('#login-riff').onclick = () => api.post('/api/login/riff').catch((e) => toast(e.message, true));
 $('#logout').onclick = async () => { await api.post('/api/logout'); $('#settings').hidden = true; };
+$('#quit').onclick = async () => {
+  if (S.engine?.decks.some((d) => d.playing)) return toast('A deck is still playing. Pause it before quitting.', true);
+  await api.post('/api/quit').catch(() => {});
+  document.body.innerHTML = '<div style="display:grid;place-items:center;height:100vh;color:#9a9ca4">Slipmat has quit. Start it again from your app launcher.</div>';
+};
 
 // ---- keyboard ------------------------------------------------------------------------------
 

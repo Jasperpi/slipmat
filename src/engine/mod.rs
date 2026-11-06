@@ -695,7 +695,11 @@ impl Engine {
         st.head_level = self.head_level;
         st.master_meter = [self.master_meter[0].level, self.master_meter[1].level];
         st.limiting = self.limiting < 0.97;
-        st.fx = self.fx.iter().map(|u| FxState { kind: u.kind, on: u.on, beats: u.beats, depth: u.depth, assign: u.assign }).collect();
+        // Written in place: this runs in the audio callback, which must not allocate.
+        st.fx.resize_with(self.fx.len(), FxState::default);
+        for (slot, u) in st.fx.iter_mut().zip(&self.fx) {
+            *slot = FxState { kind: u.kind, on: u.on, beats: u.beats, depth: u.depth, assign: u.assign };
+        }
         st.quantize = self.quantize;
         st.auto_gain = self.auto_gain;
         st.clock = self.clock;

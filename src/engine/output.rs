@@ -119,7 +119,7 @@ impl Output {
                 // Bumped on every open; a silent clock runs only while it matches.
                 let silent = Arc::new(std::sync::atomic::AtomicU64::new(0));
                 let mut current = cfg.clone();
-                let mut open = |cfg: &OutputConfig, running: &mut Option<Running>| -> OutputStatus {
+                let open = |cfg: &OutputConfig, running: &mut Option<Running>| -> OutputStatus {
                     *running = None;
                     let generation = silent.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
                     let mut last_err = None;
