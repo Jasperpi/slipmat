@@ -367,13 +367,15 @@ function buildMixer() {
   m.headMix = knob({ label: 'CUE/MST', bipolar: false, center: 0, small: true, onChange: (v) => ctl('head_mix', { v }) });
   m.headMix.el.title = 'Headphones: cued channels (left) to master (right)';
   m.headLevel = knob({ label: 'PHONES', bipolar: false, center: 0.8, small: true, onChange: (v) => ctl('head_level', { v }) });
+  m.masterCue = btn('MST', 'Master cue: hear the master in the headphones too', 'xs');
+  m.masterCue.onclick = () => ctl('master_cue', { on: !S.engine?.master_cue });
   m.quantize = btn('Q', 'Quantize: hot cues, loops and jumps land on the beat', 'xs');
   m.quantize.onclick = () => ctl('quantize', { on: !S.engine?.quantize });
   m.phase = document.createElement('div');
   m.phase.className = 'phase';
   m.phase.title = 'Beat alignment between the decks';
   m.phase.innerHTML = '<i></i>';
-  centre.append(m.master.el, m.headMix.el, m.headLevel.el, m.quantize, m.phase);
+  centre.append(m.master.el, m.headMix.el, m.headLevel.el, m.masterCue, m.quantize, m.phase);
   root.append(strips[0], centre, strips[1]);
 
   // Crossfader with assign switches and curve.
@@ -754,6 +756,7 @@ function onState(msg) {
   mixer.headLevel.update(e.head_level);
   mixer.xf.update(e.crossfader);
   cls(mixer.quantize, 'on', e.quantize);
+  cls(mixer.masterCue, 'on', e.master_cue);
   if (document.activeElement !== mixer.curve) mixer.curve.value = e.curve;
   e.fx.forEach((fx, u) => {
     const f = mixer.fx[u];
@@ -833,6 +836,7 @@ function onEvent(ev) {
   switch (ev.t) {
     case 'notice': toast(ev.text, ev.error); break;
     case 'browse': library.move(ev.delta); break;
+    case 'zoom': zoom(ev.delta > 0 ? 1 : -1); break;
     case 'browse_press': library.press(); break;
     case 'load_selected': load(ev.d, library.selected()); break;
     case 'analysed': library.updateAnalysis(ev.id, ev.bpm, ev.key); break;

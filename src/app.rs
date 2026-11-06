@@ -56,6 +56,8 @@ pub enum Event {
     Notice { text: String, error: bool },
     /// The controller's browse knob turned.
     Browse { delta: i32 },
+    /// SHIFT + browse knob: zoom the waveforms in (negative) or out.
+    Zoom { delta: i32 },
     /// The browse knob was pushed.
     BrowsePress { shift: bool },
     /// A LOAD button: load the highlighted song onto deck `d`.

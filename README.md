@@ -48,13 +48,15 @@ account is playing elsewhere.
 - **FX**: two beat-synced units (echo, reverb, flanger, phaser, roll, trans,
   crush, wobble) on deck 1, deck 2 or the master. On the controller, PAD FX
   modes hold-to-play effects.
-- **Controller**: Pioneer DDJ-FLX4 / DDJ-400 mapping with LED feedback, VU
-  meters, soft takeover on the tempo faders, hot-plugging.
+- **Controller**: Pioneer DDJ-FLX4, mapped from AlphaTheta's official MIDI
+  message list (`research/flx4/`), with LED feedback, channel meters, vinyl
+  mode set from Settings, soft takeover on the tempo faders, hot-plugging.
+  (The DDJ-400 shares most of the layout.)
 - **Sound**: a DDJ is a four-channel sound card: master on 1-2 (the RCA
   outs), headphones on 3-4. Without one, the laptop plays the master and
   *split cue* (Settings) puts the headphone cue in the left ear.
 
-## Controller layout (DDJ-FLX4 / DDJ-400)
+## Controller layout (DDJ-FLX4)
 
 | Control | Does |
 |---|---|
@@ -63,14 +65,19 @@ account is playing elsewhere.
 | SHIFT + CUE | back to the start |
 | Jog top / side | scratch (vinyl mode) / nudge; SHIFT + jog searches |
 | BEAT SYNC / SHIFT + BEAT SYNC | sync / change tempo range |
-| LOOP IN (hold for 4 beats), LOOP OUT, RELOOP/EXIT | loops |
+| IN, OUT | loop in / loop out |
+| 4 BEAT/EXIT (SHIFT) | 4-beat loop, or exit the loop (back into it) |
 | CUE/LOOP CALL ◀ ▶ | halve/double the loop; without a loop, jump 4 beats |
 | SHIFT + CUE/LOOP CALL | jump 16 beats |
+| SHIFT + IN / OUT | halve / double the loop |
 | Pads: HOT CUE, BEAT LOOP, BEAT JUMP, PAD FX1/2 | hot cues (SHIFT deletes), auto loops, jumps, held effects |
 | Headphone CUE / SHIFT + CUE | headphone cue / key lock |
 | SHIFT + HOT CUE (keyboard mode) pads | stems: 1-4 vocals/melody/bass/drums on-off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all back |
-| BEAT FX section | effect unit 1: select, beat ◀ ▶, channel, level, on/off |
+| BEAT FX section | effect unit 1: select, beat ◀ ▶, CH1/CH2/both lever, level/depth, on/off (blinks while on) |
+| MASTER LEVEL, MASTER CUE | master volume, master in the headphones |
+| HEADPHONE MIX / LEVEL | cue-to-master blend, headphone volume |
 | Browse knob, push, LOAD 1/2 | move in the list, switch playlists/songs, load |
+| SHIFT + browse knob | zoom the waveforms |
 
 ## Not yet
 

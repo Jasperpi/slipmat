@@ -65,6 +65,8 @@ pub enum Control {
     Master { v: f32 },
     HeadMix { v: f32 },
     HeadLevel { v: f32 },
+    /// Hear the master in the headphones too (the MASTER CUE button).
+    MasterCue { on: bool },
     FxKind { u: usize, kind: FxKind },
     FxOn { u: usize, on: bool },
     FxBeats { u: usize, i: usize },
@@ -187,6 +189,7 @@ pub struct State {
     pub master: f32,
     pub head_mix: f32,
     pub head_level: f32,
+    pub master_cue: bool,
     pub master_meter: [f32; 2],
     pub limiting: bool,
     pub fx: Vec<FxState>,
@@ -207,6 +210,7 @@ pub struct Engine {
     master: f32,
     head_mix: f32,
     head_level: f32,
+    master_cue: bool,
     quantize: bool,
     auto_gain: bool,
     /// Tempo (BPM) synced decks follow.
@@ -258,6 +262,7 @@ impl Engine {
             master: 0.8,
             head_mix: 0.0,
             head_level: 0.8,
+            master_cue: false,
             quantize: true,
             auto_gain: true,
             sync_bpm: None,
@@ -478,6 +483,7 @@ impl Engine {
             Master { v } => self.master = v.clamp(0.0, 1.0),
             HeadMix { v } => self.head_mix = v.clamp(0.0, 1.0),
             HeadLevel { v } => self.head_level = v.clamp(0.0, 1.0),
+            MasterCue { on } => self.master_cue = on,
             FxKind { u, kind } if u < FX_UNITS => self.fx[u].set_kind(kind),
             FxOn { u, on } if u < FX_UNITS => self.fx[u].on = on,
             FxBeats { u, i } if u < FX_UNITS => self.fx[u].beats = i.min(fx::BEATS.len() - 1),
@@ -653,6 +659,12 @@ impl Engine {
         for c in 0..2 {
             self.master_meter[c].feed(&[peak[c]], secs as f32);
         }
+        // MASTER CUE puts the master in the headphones' cue side as well.
+        if self.master_cue {
+            for (c, m) in cue.iter_mut().zip(master.iter()) {
+                *c += *m;
+            }
+        }
         // Headphones: the cued channels blended with the master.
         let (cg, mgain) = ((1.0 - self.head_mix).sqrt(), self.head_mix.sqrt());
         let hl = dsp::fader_gain(self.head_level) * 1.2;
@@ -718,6 +730,7 @@ impl Engine {
         st.master = self.master;
         st.head_mix = self.head_mix;
         st.head_level = self.head_level;
+        st.master_cue = self.master_cue;
         st.master_meter = [self.master_meter[0].level, self.master_meter[1].level];
         st.limiting = self.limiting < 0.97;
         // Written in place: this runs in the audio callback, which must not allocate.

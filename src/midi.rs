@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 
 use crate::app::{App, Event};
-use crate::engine::fx::{ALL as FX_ALL, BEATS, FxKind, MASTER};
+use crate::engine::fx::{ALL as FX_ALL, BEATS, FxKind};
 use crate::engine::{Control, DECKS, State};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,7 +101,8 @@ pub struct Mapper {
     msb: HashMap<(u8, u8), u8>,
     pad_mode: [PadMode; DECKS],
     last_tempo: [Option<f32>; DECKS],
-    loop_in_at: [Option<Instant>; DECKS],
+    /// Where the BEAT FX channel lever points: CH1, CH2 or both.
+    fx_lever: [bool; 2],
     /// Pads held down in a PAD FX mode, and the unit settings to restore.
     pad_fx: Option<(usize, u8, crate::engine::FxState)>,
     pub vinyl: bool,
@@ -114,7 +115,7 @@ impl Default for Mapper {
             msb: HashMap::new(),
             pad_mode: [PadMode::HotCue; DECKS],
             last_tempo: [None; DECKS],
-            loop_in_at: [None; DECKS],
+            fx_lever: [true, false],
             pad_fx: None,
             vinyl: true,
             invert_tempo: false,
@@ -176,17 +177,15 @@ impl Mapper {
                         out.push(c(Control::Range { d, range: RANGES[i] }));
                         out.push(Out::Ev(Event::Notice { text: format!("Deck {} tempo range ±{:.0}%", d + 1, RANGES[i] * 100.0), error: false }));
                     }
-                    0x10 => {
-                        if down {
-                            self.loop_in_at[d] = Some(Instant::now());
-                            out.push(c(Control::LoopIn { d }));
-                        } else if self.loop_in_at[d].take().is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
-                            // Held: a four-beat loop, like Pioneer's own software.
-                            out.push(c(Control::AutoLoop { d, beats: 4.0 }));
-                        }
-                    }
+                    0x10 if down => out.push(c(Control::LoopIn { d })),
                     0x11 if down => out.push(c(Control::LoopOut { d })),
-                    0x4D | 0x50 if down => out.push(c(Control::Reloop { d })),
+                    // 4 BEAT / EXIT: a four-beat loop, or out of the loop playing.
+                    0x4D if down => {
+                        let looping = deck.and_then(|s| s.lp).is_some_and(|l| l.active);
+                        out.push(c(if looping { Control::Reloop { d } } else { Control::AutoLoop { d, beats: 4.0 } }));
+                    }
+                    // SHIFT + 4 BEAT / EXIT: back into the last loop.
+                    0x50 if down => out.push(c(Control::Reloop { d })),
                     0x4C if down => out.push(c(Control::LoopHalve { d })),
                     0x4E if down => out.push(c(Control::LoopDouble { d })),
                     0x51 | 0x53 if down => {
@@ -248,6 +247,8 @@ impl Mapper {
             // ---- mixer section -------------------------------------------------
             (0xB0, 6) => match data {
                 0x40 => out.push(Out::Ev(Event::Browse { delta: if v < 64 { v as i32 } else { v as i32 - 128 } })),
+                // SHIFT + browse: zoom the waveforms.
+                0x64 => out.push(Out::Ev(Event::Zoom { delta: if v < 64 { v as i32 } else { v as i32 - 128 } })),
                 cc => {
                     if let Some(x) = self.fine(status, cc, v) {
                         match cc - 0x20 {
@@ -256,6 +257,7 @@ impl Mapper {
                             0x18 => out.push(c(Control::Filter { d: 1, v: x * 2.0 - 1.0 })),
                             0x0C => out.push(c(Control::HeadMix { v: x })),
                             0x0D => out.push(c(Control::HeadLevel { v: x })),
+                            0x08 => out.push(c(Control::Master { v: x })),
                             _ => {}
                         }
                     }
@@ -266,6 +268,7 @@ impl Mapper {
                 0x42 => out.push(Out::Ev(Event::BrowsePress { shift: true })),
                 0x46 => out.push(Out::Ev(Event::LoadSelected { d: 0 })),
                 0x47 => out.push(Out::Ev(Event::LoadSelected { d: 1 })),
+                0x63 => out.push(c(Control::MasterCue { on: !st.master_cue })),
                 _ => {}
             },
             // ---- beat FX -------------------------------------------------------
@@ -281,9 +284,22 @@ impl Mapper {
                     }
                     0x4A if down => out.push(c(Control::FxBeats { u: 0, i: fx.beats.saturating_sub(1) })),
                     0x4B if down => out.push(c(Control::FxBeats { u: 0, i: (fx.beats + 1).min(BEATS.len() - 1) })),
-                    0x10 if down => out.push(c(Control::FxAssign { u: 0, mask: 1 })),
-                    0x11 if down => out.push(c(Control::FxAssign { u: 0, mask: 2 })),
-                    0x14 if down => out.push(c(Control::FxAssign { u: 0, mask: MASTER })),
+                    // The CH SELECT lever (CH1 / CH2 / CH1&CH2) reports each
+                    // side as on or off; the unit follows the lever.
+                    0x10 | 0x11 => {
+                        let side = match (ch, data) {
+                            (4, 0x10) => Some(0),
+                            (5, 0x11) => Some(1),
+                            _ => None,
+                        };
+                        if let Some(side) = side {
+                            self.fx_lever[side] = down;
+                            let mask = (self.fx_lever[0] as u8) | (self.fx_lever[1] as u8) << 1;
+                            if mask != 0 {
+                                out.push(c(Control::FxAssign { u: 0, mask }));
+                            }
+                        }
+                    }
                     0x47 if down => out.push(c(Control::FxOn { u: 0, on: !fx.on })),
                     0x43 if down => out.push(c(Control::FxOn { u: 0, on: false })),
                     _ => {}
@@ -384,7 +400,9 @@ impl Mapper {
                 }
             }
             let db = 20.0 * s.meter[0].max(s.meter[1]).max(1e-6).log10();
-            l.insert((0xB0 | d as u8, 0x02), (((db + 36.0) / 36.0).clamp(0.0, 1.0) * 127.0) as u8);
+            l.insert((0xB0 | d as u8, 0x02), meter_value(db));
+            // The unit's vinyl mode is set from here (it has no switch of its own).
+            l.insert((n, 0x17), on(self.vinyl));
             if loaded_flash[d] {
                 l.insert((0x9F, d as u8), 0x7F);
             }
@@ -394,6 +412,22 @@ impl Mapper {
         }
         l
     }
+}
+
+/// Level in dB to the FLX4's channel meter: its segments light at
+/// 0x26 (green), 0x41 (green 2), 0x57 (orange), 0x65 (orange 2), 0x77 (red).
+fn meter_value(db: f32) -> u8 {
+    const POINTS: [(f32, f32); 7] = [(-36.0, 0.0), (-24.0, 38.0), (-12.0, 65.0), (-6.0, 87.0), (-3.0, 101.0), (-0.5, 119.0), (0.0, 127.0)];
+    if db <= POINTS[0].0 {
+        return 0;
+    }
+    for w in POINTS.windows(2) {
+        let ((a, va), (b, vb)) = (w[0], w[1]);
+        if db <= b {
+            return (va + (vb - va) * (db - a) / (b - a)).round() as u8;
+        }
+    }
+    127
 }
 
 fn is_controller(name: &str) -> bool {
@@ -575,6 +609,29 @@ mod tests {
         assert_eq!(ctl(&mut m, &[0xB0, 0x22, 0x43], &st), ["JogScratch { d: 0, ticks: 3.0 }"]);
         assert_eq!(ctl(&mut m, &[0xB0, 0x21, 0x3E], &st), ["JogBend { d: 0, ticks: -2.0 }"]);
         assert_eq!(ctl(&mut m, &[0xB6, 0x40, 0x7F], &st), ["Browse { delta: -1 }"]);
+    }
+
+    #[test]
+    fn flx4_specifics() {
+        let mut m = Mapper::default();
+        let mut st = state();
+        // 4 BEAT / EXIT: a loop when there is none, out when there is.
+        assert_eq!(ctl(&mut m, &[0x90, 0x4D, 0x7F], &st), ["AutoLoop { d: 0, beats: 4.0 }"]);
+        st.decks[0].lp = Some(crate::engine::deck::Loop { start: 0.0, end: 1000.0, active: true });
+        assert_eq!(ctl(&mut m, &[0x90, 0x4D, 0x7F], &st), ["Reloop { d: 0 }"]);
+        // BEAT FX lever: CH2, then CH1&CH2 (as the unit reports them).
+        ctl(&mut m, &[0x94, 0x10, 0x00], &st);
+        assert_eq!(ctl(&mut m, &[0x95, 0x11, 0x7F], &st), ["FxAssign { u: 0, mask: 2 }"]);
+        assert_eq!(ctl(&mut m, &[0x94, 0x10, 0x7F], &st), ["FxAssign { u: 0, mask: 3 }"]);
+        // MASTER LEVEL is a 14-bit knob on the mixer channel.
+        ctl(&mut m, &[0xB6, 0x08, 0x7F], &st);
+        assert_eq!(ctl(&mut m, &[0xB6, 0x28, 0x7F], &st), ["Master { v: 1.0 }"]);
+        assert_eq!(ctl(&mut m, &[0x96, 0x63, 0x7F], &st), ["MasterCue { on: true }"]);
+        assert_eq!(ctl(&mut m, &[0xB6, 0x64, 0x7F], &st), ["Zoom { delta: -1 }"]);
+        // Meter: silence dark, -12 dB in green 2, clipping red.
+        assert_eq!(meter_value(-60.0), 0);
+        assert!((0x41..0x57).contains(&meter_value(-10.0)));
+        assert!(meter_value(0.0) >= 0x77);
     }
 
     #[test]
