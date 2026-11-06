@@ -29,7 +29,7 @@ use rustfft::FftPlanner;
 use rustfft::num_complex::Complex32;
 
 use crate::paths;
-use crate::track::{SRC_RATE, TrackAudio};
+use crate::track::{SRC_RATE, TrackAudio, WAVE_HOP};
 
 const N: usize = 4096;
 const HOP: usize = 1024;
@@ -142,6 +142,10 @@ pub struct Stems {
     /// Set when the song leaves the deck: stop working on it.
     pub cancelled: AtomicBool,
     pub model: Model,
+    /// Waveform per stem (vocals, melody, bass, drums: a byte each per
+    /// column of `WAVE_HOP` frames), filled in as separation goes.
+    wave: Box<[std::sync::atomic::AtomicU32]>,
+    wave_len: AtomicUsize,
 }
 
 fn atomics(n: usize) -> Box<[AtomicI16]> {
@@ -160,6 +164,12 @@ impl Stems {
             status: AtomicU8::new(Status::Waiting as u8),
             cancelled: AtomicBool::new(false),
             model,
+            wave: {
+                let mut v = Vec::with_capacity(cap / WAVE_HOP + 1);
+                v.resize_with(cap / WAVE_HOP + 1, || std::sync::atomic::AtomicU32::new(0));
+                v.into_boxed_slice()
+            },
+            wave_len: AtomicUsize::new(0),
         }
     }
 
@@ -182,6 +192,48 @@ impl Stems {
         const S: f32 = 1.0 / 32768.0;
         let d = &self.data[stem];
         (d[2 * i].load(Ordering::Relaxed) as f32 * S, d[2 * i + 1].load(Ordering::Relaxed) as f32 * S)
+    }
+
+    pub fn wave_len(&self) -> usize {
+        self.wave_len.load(Ordering::Acquire)
+    }
+
+    /// The stem waveform as bytes (vocals, melody, bass, drums per column), from `from`.
+    pub fn wave_bytes(&self, from: usize) -> Vec<u8> {
+        let n = self.wave_len();
+        let mut out = Vec::with_capacity(n.saturating_sub(from) * 4);
+        for i in from.min(n)..n {
+            out.extend_from_slice(&self.wave[i].load(Ordering::Relaxed).to_le_bytes());
+        }
+        out
+    }
+
+    /// Add waveform columns for everything separated since last time.
+    fn update_wave(&self, track: &TrackAudio) {
+        let ready = self.ready();
+        let len = track.len();
+        let mut col = self.wave_len();
+        while (col + 1) * WAVE_HOP <= ready && col < self.wave.len() {
+            let mut sq = [0.0f32; 4];
+            for i in col * WAVE_HOP..(col + 1) * WAVE_HOP {
+                let (ml, mr) = track.frame(i, len);
+                let v = self.frame(0, i);
+                let d = self.frame(1, i);
+                let b = self.frame(2, i);
+                let mono = |x: (f32, f32)| (x.0 + x.1) * 0.5;
+                let (vv, dd, bb) = (mono(v), mono(d), mono(b));
+                let mel = (ml + mr) * 0.5 - vv - dd - bb;
+                sq[0] += vv * vv;
+                sq[1] += mel * mel;
+                sq[2] += bb * bb;
+                sq[3] += dd * dd;
+            }
+            let byte = |s: f32| (((s / WAVE_HOP as f32).sqrt() * 2.2).min(1.0).powf(0.8) * 255.0) as u8;
+            let packed = u32::from_le_bytes([byte(sq[0]), byte(sq[1]), byte(sq[2]), byte(sq[3])]);
+            self.wave[col].store(packed, Ordering::Relaxed);
+            col += 1;
+            self.wave_len.store(col, Ordering::Release);
+        }
     }
 
     fn write(&self, stem: usize, c: usize, i: usize, v: f32) {
@@ -336,6 +388,7 @@ pub fn separate(track: &TrackAudio, stems: &Stems) -> Result<()> {
     };
     if finished {
         stems.ready.store(track.len(), Ordering::Release);
+        stems.update_wave(track);
         stems.set_status(Status::Done);
         log::info!(
             "stems ({:?}): {:.0} s of song separated in {:.1} s",
@@ -438,6 +491,7 @@ fn demucs(track: &TrackAudio, stems: &Stems) -> Result<bool> {
             }
         }
         stems.ready.store(start + fin, Ordering::Release);
+        stems.update_wave(track);
         if last {
             break;
         }
@@ -582,6 +636,7 @@ fn spleeter(track: &TrackAudio, stems: &Stems) -> Result<bool> {
         }
         let ready = ((base + span as i64).max(0) as usize).min(len);
         stems.ready.store(ready, Ordering::Release);
+        stems.update_wave(track);
         split += 1;
         if done && (first + SPLIT) >= frames_total {
             break;

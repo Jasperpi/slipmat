@@ -2,7 +2,7 @@
 // page shows its state (about 30 times a second) and sends it commands.
 
 import { knob, fader } from './controls.js';
-import { WaveData, SRC, HOP, CUE_COLORS } from './wave.js';
+import { WaveData, StemWave, SRC, HOP, CUE_COLORS } from './wave.js';
 import { Library, esc } from './library.js';
 import { keyLabel, keyColor, useCamelot } from './keys.js';
 
@@ -504,8 +504,21 @@ function drawLanes(t) {
       const pos = livePos(ui, t);
       const left = pos - span / 2;
       const px = (f) => (f - left) / span * W;
-      ui.wave.paint(Math.round(laneH - 8 * dpr));
+      const th = Math.round(laneH - 8 * dpr);
+      ui.wave.paint(th);
       ui.wave.blit(ctx, left / HOP, span / HOP, 0, y0 + 4 * dpr, W, laneH - 8 * dpr);
+      // Where the stems are ready, show the song as its stems instead.
+      const sw = ui.stemWave;
+      if (sw?.cols && S.settings?.stem_colors !== false) {
+        sw.paint(th);
+        const xEnd = Math.min(W, (sw.drawn * HOP - left) / span * W);
+        if (xEnd > 0) {
+          ctx.fillStyle = '#08090a';
+          ctx.fillRect(0, y0 + 4 * dpr, xEnd, laneH - 8 * dpr);
+          const alpha = st.stems.map((g) => 0.16 + 0.84 * g);
+          sw.blit(ctx, left / HOP, span / HOP, 0, y0 + 4 * dpr, W, laneH - 8 * dpr, alpha);
+        }
+      }
       // Not downloaded yet.
       if (!st.done) {
         const x = px(st.decoded);
@@ -664,6 +677,29 @@ function trackWave(ui, meta) {
   pull();
 }
 
+function trackStemWave(ui, meta, st) {
+  const key = meta?.track_key ?? 0;
+  if (!meta || !st?.stems_status || st.stems_status === 'off' || st.stems_status === 'failed') {
+    if (ui.stemWave && ui.stemWave.key !== key) ui.stemWave = null;
+    return;
+  }
+  if (ui.stemWave?.key === key) return;
+  const sw = new StemWave(key);
+  ui.stemWave = sw;
+  const pull = async () => {
+    if (ui.stemWave !== sw) return;
+    try {
+      const r = await fetch(`/api/deck/${ui.d}/stemwave?from=${sw.cols}`);
+      if (r.ok && r.headers.get('x-track-key') === String(key)) {
+        sw.append(new Uint8Array(await r.arrayBuffer()));
+        sw.done = r.headers.get('x-wave-done') === '1' && sw.cols >= +r.headers.get('x-wave-total');
+      }
+    } catch {}
+    if (!sw.done) setTimeout(pull, 400);
+  };
+  pull();
+}
+
 function leadDeck() {
   const st = S.engine?.decks;
   if (!st) return null;
@@ -695,6 +731,7 @@ function onState(msg) {
     est.at = t;
     est.speed = st.speed;
     trackWave(ui, meta);
+    trackStemWave(ui, meta, st);
     cls(ui.head, 'empty', !meta);
     setText(ui.title, meta ? meta.name : 'Drop a song here');
     setText(ui.artist, meta ? meta.artist : `or highlight one and press LOAD ${d + 1}`);
@@ -913,6 +950,7 @@ async function openSettings() {
   $('#set-camelot').checked = s.camelot;
   $('#set-stems').checked = s.stems;
   $('#set-stem-quality').value = s.stem_quality;
+  $('#set-stem-colors').checked = s.stem_colors;
   const login = S.extras.login;
   setText($('#set-account'), login?.state === 'online' ? `Signed in as ${login.user}` : 'Not signed in');
   outputStatus(S.extras.output);
@@ -946,6 +984,7 @@ async function saveSettings() {
   s.camelot = $('#set-camelot').checked;
   s.stems = $('#set-stems').checked;
   s.stem_quality = $('#set-stem-quality').value;
+  s.stem_colors = $('#set-stem-colors').checked;
   useCamelot(s.camelot);
   try {
     const r = await api.post('/api/settings', s);

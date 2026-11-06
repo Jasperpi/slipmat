@@ -72,6 +72,7 @@ pub async fn run(open: bool) -> Result<()> {
         .route("/api/load", post(load))
         .route("/api/analyze", post(analyze))
         .route("/api/deck/{d}/wave", get(wave))
+        .route("/api/deck/{d}/stemwave", get(stem_wave))
         .route("/api/login/browser", post(login_browser))
         .route("/api/login/riff", post(login_riff))
         .route("/api/logout", post(logout))
@@ -202,6 +203,21 @@ async fn wave(State(app): State<Shared>, Path(d): Path<usize>, Query(q): Query<W
                 .unwrap()
         }
         None => (StatusCode::NOT_FOUND, "empty deck").into_response(),
+    }
+}
+
+/// The deck's stem waveform so far (4 bytes per column: vocals, melody, bass, drums).
+async fn stem_wave(State(app): State<Shared>, Path(d): Path<usize>, Query(q): Query<WaveQ>) -> Response {
+    let on = app.decks.lock().unwrap().get(d).cloned().flatten();
+    match on.and_then(|o| o.stems.map(|s| (o.audio, s))) {
+        Some((audio, stems)) => Response::builder()
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header("x-wave-total", stems.wave_len().to_string())
+            .header("x-wave-done", if stems.status() == crate::stems::Status::Done { "1" } else { "0" })
+            .header("x-track-key", (Arc::as_ptr(&audio) as usize).to_string())
+            .body(Body::from(stems.wave_bytes(q.from.unwrap_or(0))))
+            .unwrap(),
+        None => (StatusCode::NOT_FOUND, "no stems on this deck").into_response(),
     }
 }
 

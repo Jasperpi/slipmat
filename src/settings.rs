@@ -25,6 +25,8 @@ pub struct Settings {
     pub stems: bool,
     /// Which separation: auto (Demucs on computers with 12 GB+), fast, best.
     pub stem_quality: crate::stems::Quality,
+    /// Draw the big waveforms in stem colours once stems are ready.
+    pub stem_colors: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             camelot: true,
             stems: true,
             stem_quality: crate::stems::Quality::Auto,
+            stem_colors: true,
         }
     }
 }

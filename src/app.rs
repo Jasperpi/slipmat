@@ -29,6 +29,7 @@ const TARGET_DB: f32 = -11.0;
 pub struct OnDeck {
     pub track: Track,
     pub audio: Arc<TrackAudio>,
+    pub stems: Option<Arc<Stems>>,
     pub analysis: Option<Analysis>,
     pub analysing: bool,
 }
@@ -261,9 +262,9 @@ impl App {
         let grid = saved.grid.or(saved.analysis.as_ref().map(|a| Grid { bpm: a.bpm, anchor: a.anchor }));
         let cue = saved.cue.or(saved.analysis.as_ref().map(auto_cue)).unwrap_or(0.0);
         let gain_db = saved.analysis.as_ref().map(auto_gain).unwrap_or(0.0);
-        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), stems, grid, cue, hotcues: saved.hotcues, gain_db })?;
+        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), stems: stems.clone(), grid, cue, hotcues: saved.hotcues, gain_db })?;
         let analysing = saved.analysis.is_none();
-        self.decks.lock().unwrap()[d] = Some(OnDeck { track: track.clone(), audio: audio.clone(), analysis: saved.analysis.clone(), analysing });
+        self.decks.lock().unwrap()[d] = Some(OnDeck { track: track.clone(), audio: audio.clone(), stems, analysis: saved.analysis.clone(), analysing });
         let app = self.clone();
         let id = track.id.clone();
         tokio::spawn(async move { app.after_load(d, id, audio, analysing).await });
