@@ -1,0 +1,50 @@
+# Ready-to-run builds for Mac (Apple Silicon) and Windows. Started by hand
+# (Actions tab → Builds → Run workflow), since Mac and Windows minutes count
+# 10× and 2× against the free allowance. Download from the run's Artifacts.
+name: Builds
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Which build
+        type: choice
+        options: [both, mac, windows]
+        default: both
+jobs:
+  mac:
+    if: inputs.target != 'windows'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - run: cargo test --release --locked
+      - name: Package
+        run: |
+          mkdir slipmat
+          cp target/release/slipmat README.md slipmat/
+          cp target/release/*.dylib slipmat/ 2>/dev/null || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slipmat-mac
+          path: slipmat
+  windows:
+    if: inputs.target != 'mac'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force slipmat | Out-Null
+          Copy-Item target\release\slipmat.exe slipmat\
+          Copy-Item target\release\DirectML.dll slipmat\ -ErrorAction SilentlyContinue
+          Copy-Item README.md slipmat\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slipmat-windows
+          path: slipmat

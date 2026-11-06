@@ -16,6 +16,19 @@ Needs Spotify Premium. Slipmat signs in once (or reuses riff's login on the
 same machine) and is not a Spotify Connect device: it never touches what the
 account is playing elsewhere.
 
+## On a Mac
+
+Apple Silicon or Intel, macOS 12 or later. In Terminal:
+
+```
+git clone git@github.com:Jasperpi/slipmat.git && cd slipmat && sh scripts/mac-install.sh
+```
+
+The script installs Rust if needed (Apple's command line tools must be there:
+`xcode-select --install`), builds Slipmat (a few minutes) and puts a
+**Slipmat** app in `~/Applications`. The FLX4 needs no driver on a Mac.
+On a Mac with 16 GB, stems use Demucs automatically.
+
 ## On Windows
 
 Slipmat builds and runs on Windows too (type-checked for
@@ -27,8 +40,8 @@ Slipmat builds and runs on Windows too (type-checked for
    `powershell -ExecutionPolicy Bypass -File scripts\windows-install.ps1`.
    It builds Slipmat (a few minutes) and adds Start menu and desktop
    shortcuts. Closing Slipmat's console window quits it.
-   Alternatively, once the code is on GitHub, the *Windows build* action
-   produces a ready-made zip (`slipmat.exe` + `DirectML.dll`).
+   Alternatively, run the *Builds* action on GitHub (Actions → Builds → Run
+   workflow) for a ready-made zip (`slipmat.exe` + `DirectML.dll`).
 
 On a 16 GB PC, stems use Demucs automatically, on the graphics card through
 DirectML. Close rekordbox before starting Slipmat: on Windows only one app can
