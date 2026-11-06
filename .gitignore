@@ -1,3 +1,4 @@
 /target
 /research/*.f32
 /research/demucs/*.f32
+/research/*.log
