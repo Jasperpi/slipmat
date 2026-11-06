@@ -878,6 +878,10 @@ function onEvent(ev) {
     case 'browse_press': library.press(); break;
     case 'load_selected': load(ev.d, library.selected()); break;
     case 'analysed': library.updateAnalysis(ev.id, ev.bpm, ev.key); break;
+    case 'list_changed':
+      if (ev.list === 'playlists') library.loadPlaylists();
+      else if (ev.list === library.source) library.open(library.source, library.sourceId, true);
+      break;
   }
 }
 

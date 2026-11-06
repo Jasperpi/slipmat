@@ -34,8 +34,27 @@ pub struct OnDeck {
     pub analysing: bool,
 }
 
+fn list_path(name: &str) -> std::path::PathBuf {
+    crate::paths::cache().join("lists").join(format!("{name}.json"))
+}
+
+fn disk_list<T: serde::de::DeserializeOwned>(name: &str) -> Option<T> {
+    serde_json::from_slice(&std::fs::read(list_path(name)).ok()?).ok()
+}
+
+fn save_list<T: Serialize>(name: &str, v: &T) {
+    let path = list_path(name);
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    if let Ok(bytes) = serde_json::to_vec(v) {
+        let tmp = path.with_extension("tmp");
+        if std::fs::write(&tmp, bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
+
 /// One row in a song list.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct Row {
     pub uri: String,
     pub id: String,
@@ -65,6 +84,8 @@ pub enum Event {
     LoadSelected { d: usize },
     /// Analysis finished for a song (refresh BPM/key columns).
     Analysed { id: String, bpm: f64, key: Option<u8> },
+    /// A list shown from the saved copy turned out different: fetch it again.
+    ListChanged { list: String },
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -193,20 +214,101 @@ impl App {
         Ok(rows)
     }
 
-    pub async fn liked(&self) -> Result<Vec<Row>> {
+    /// Liked Songs. A copy kept on disk shows at once (even before Spotify
+    /// has answered); the real list is fetched behind it and the page told
+    /// if anything changed.
+    pub async fn liked(self: &Arc<Self>) -> Result<Vec<Row>> {
+        if let Some(rows) = self.fresh_list("liked") {
+            return Ok(rows);
+        }
+        if let Some(rows) = disk_list::<Vec<Row>>("liked") {
+            let app = self.clone();
+            let before: Vec<String> = rows.iter().map(|r| r.uri.clone()).collect();
+            tokio::spawn(async move {
+                if let Ok(fresh) = app.fetch_liked().await {
+                    if fresh.iter().map(|r| &r.uri).ne(before.iter()) {
+                        let _ = app.events.send(Event::ListChanged { list: "liked".into() });
+                    }
+                }
+            });
+            return Ok(self.with_analysis(rows));
+        }
+        self.fetch_liked().await
+    }
+
+    async fn fetch_liked(&self) -> Result<Vec<Row>> {
         let session = self.spotify.session().await?;
-        self.cached_list("liked", || async move {
-            let (mut items, _) = spot::collection(&session, "collection").await?;
-            items.retain(|s| !s.removed && s.uri.starts_with("spotify:track:"));
-            items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
-            let uris: Vec<String> = items.iter().map(|s| s.uri.clone()).collect();
-            let mut tracks = spot::tracks(&session, &uris).await;
-            for (t, s) in tracks.iter_mut().zip(&items) {
-                t.added_at = Some(s.added_at);
+        let (mut items, _) = spot::collection(&session, "collection").await?;
+        items.retain(|s| !s.removed && s.uri.starts_with("spotify:track:"));
+        items.sort_by(|a, b| b.added_at.cmp(&a.added_at));
+        let uris: Vec<String> = items.iter().map(|s| s.uri.clone()).collect();
+        let mut tracks = spot::tracks(&session, &uris).await;
+        for (t, s) in tracks.iter_mut().zip(&items) {
+            t.added_at = Some(s.added_at);
+        }
+        let rows = self.rows(&tracks);
+        self.lists.lock().unwrap().insert("liked".into(), (Instant::now(), rows.clone()));
+        save_list("liked", &rows);
+        Ok(rows)
+    }
+
+    /// The playlist sidebar, the same way: from disk first, then fresh.
+    pub async fn playlists(self: &Arc<Self>) -> Result<serde_json::Value> {
+        if let Some(v) = disk_list::<serde_json::Value>("playlists") {
+            if self.fresh_list("playlists").is_none() {
+                let app = self.clone();
+                let saved = v.clone();
+                self.lists.lock().unwrap().insert("playlists".into(), (Instant::now(), Vec::new()));
+                tokio::spawn(async move {
+                    if let Ok(fresh) = app.fetch_playlists().await {
+                        if fresh != saved {
+                            let _ = app.events.send(Event::ListChanged { list: "playlists".into() });
+                        }
+                    }
+                });
             }
-            Ok(tracks)
-        })
-        .await
+            return Ok(v);
+        }
+        self.fetch_playlists().await
+    }
+
+    async fn fetch_playlists(&self) -> Result<serde_json::Value> {
+        let session = self.spotify.session().await?;
+        let entries = spot::rootlist(&session).await?;
+        let list: Vec<serde_json::Value> = entries
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::spotify::model::SideEntry::Folder { name, depth } => Some(serde_json::json!({ "folder": name, "depth": depth })),
+                crate::spotify::model::SideEntry::Playlist { playlist, depth } => Some(serde_json::json!({
+                    "id": playlist.id, "name": playlist.name, "owner": playlist.owner, "len": playlist.len, "depth": depth
+                })),
+                _ => None,
+            })
+            .collect();
+        let v = serde_json::Value::Array(list);
+        save_list("playlists", &v);
+        Ok(v)
+    }
+
+    fn fresh_list(&self, key: &str) -> Option<Vec<Row>> {
+        let lists = self.lists.lock().unwrap();
+        let (at, rows) = lists.get(key)?;
+        (at.elapsed() < Duration::from_secs(300)).then(|| self.with_analysis(rows.clone()))
+    }
+
+    fn with_analysis(&self, mut rows: Vec<Row>) -> Vec<Row> {
+        for r in &mut rows {
+            let s = self.store.summary(&r.id);
+            r.bpm = s.as_ref().map(|s| s.bpm);
+            r.key = s.and_then(|s| s.key);
+        }
+        rows
+    }
+
+    /// Forget saved lists (on sign-out: they belong to that account).
+    pub fn forget_lists(&self) {
+        self.lists.lock().unwrap().clear();
+        let _ = std::fs::remove_dir_all(crate::paths::cache().join("lists"));
     }
 
     pub async fn playlist(&self, id: &str) -> Result<(String, Vec<Row>)> {

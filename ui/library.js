@@ -99,23 +99,34 @@ export class Library {
     }
   }
 
-  async open(src, id) {
+  async open(src, id, quiet = false) {
     this.source = src;
+    this.sourceId = id;
     document.querySelectorAll('.source').forEach((b) => b.classList.toggle('active', b.dataset.src === src && (src !== 'playlist' || b.dataset.id === id)));
-    this.title.textContent = src === 'search' ? `Searching “${id}”…` : 'Loading…';
-    this.rows = [];
-    this.view = [];
-    this.render(true);
+    if (!quiet) {
+      this.title.textContent = src === 'search' ? `Searching “${id}”…` : 'Loading…';
+      this.rows = [];
+      this.view = [];
+      this.render(true);
+    }
     const token = (this.token = Symbol());
     try {
       const url = src === 'liked' ? '/api/liked' : src === 'search' ? `/api/search?q=${encodeURIComponent(id)}` : `/api/playlist/${encodeURIComponent(id)}`;
       const data = await this.api.get(url);
       if (token !== this.token) return;
       this.title.textContent = data.title;
+      const keep = quiet ? this.view[this.sel]?.uri : null;
       this.rows = data.rows;
-      this.sel = 0;
-      this.el.scrollTop = 0;
+      if (!quiet) {
+        this.sel = 0;
+        this.el.scrollTop = 0;
+      }
       this.apply();
+      if (keep) {
+        const i = this.view.findIndex((r) => r.uri === keep);
+        if (i >= 0) this.sel = i;
+        this.render(true);
+      }
     } catch (e) {
       if (token !== this.token) return;
       this.title.textContent = 'Couldn’t load that';

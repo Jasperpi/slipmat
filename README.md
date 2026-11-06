@@ -50,10 +50,22 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
 
 ## What it does
 
+- **Auto-DJ**: drop songs in the Auto-DJ list (or press **+**, or *Auto-DJ
+  list* for a whole playlist) and turn it on. It plays each song and mixes
+  into the next like a DJ: next song waiting at its first downbeat, started
+  on a phrase near the end, synced to the beat, faded in with its bass cut,
+  basslines swapped halfway, and (with stems) its vocals held back until the
+  old song is gone; afterwards it eases back to its own tempo. *Mix now*
+  mixes at the next bar; mixes last 8, 16 or 32 bars.
+- **Keyboard**: the whole thing can be played from the laptop. Left hand
+  runs deck 1, right hand deck 2 (press **?** for the map).
+
 - **Library**: Liked Songs, your playlists (with folders), Spotify search.
   BPM and key columns fill in as songs are analysed; *Analyze list* does a
   whole playlist in the background. Keys that mix with the playing deck stay
-  bright, BPMs within 6% turn green.
+  bright, BPMs within 6% turn green, and **Match** shows only the songs that
+  fit the playing deck. Lists are kept on disk, so Liked Songs show at once
+  when Slipmat starts (then refresh).
 - **Decks**: drag a song on, or highlight it and press LOAD. Each song is
   downloaded whole (1-2 s) so cueing, looping and scratching can jump anywhere.
   CDJ-style CUE, 8 hot cues, auto loops ¼-32 beats, loop in/out/reloop,
@@ -72,7 +84,9 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
   Spleeter 4-stem networks (Apache-2.0, via ONNX Runtime; ~80 MB, downloaded
   to `~/.cache/slipmat/models/` on first use). The stems add back up to the
   original exactly, so with every stem up you hear the untouched song.
-  Stems live in memory only.
+  Stems live in memory only. The big waveforms show each song as its stems
+  in colour (bass, melody, vocals, drums from the centre out); a muted stem
+  fades to a ghost.
 - **Sync**: tempo and beat phase, held together while both play; moving a
   synced deck's tempo moves the shared tempo.
 - **Mixer**: trim, 3-band isolator EQ (full kill), one-knob filter, channel
@@ -85,6 +99,10 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
   message list (`research/flx4/`), with LED feedback, channel meters, vinyl
   mode set from Settings, soft takeover on the tempo faders, hot-plugging.
   (The DDJ-400 shares most of the layout.)
+- **Smooth on a busy laptop**: the sound thread runs at real-time priority
+  (RTKit on Linux, Mach on macOS, MMCSS on Windows) and stem separation and
+  analysis at low priority. Mixing uses about 1% of the time it has, even
+  while a song is being split.
 - **Sound**: a DDJ is a four-channel sound card: master on 1-2 (the RCA
   outs), headphones on 3-4. Without one, the laptop plays the master and
   *split cue* (Settings) puts the headphone cue in the left ear.
@@ -124,6 +142,8 @@ other controllers.
   (`mod.rs`), filters (`dsp.rs`), effects (`fx.rs`), sound card (`output.rs`)
 - `src/loader.rs` decodes a Spotify song into memory with librespot
 - `src/analysis.rs` tempo, grid, key, loudness
+- `src/autodj.rs` Auto-DJ: when and how to mix into the next song
+- `src/priority.rs` real-time / background thread priorities
 - `src/stems.rs` stem separation (STFT → four networks → masks → iSTFT, in 12 s pieces)
 - `src/midi.rs` the controller mapping and lights
 - `src/server.rs`, `src/app.rs` the local web server and shared state

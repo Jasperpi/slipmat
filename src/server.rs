@@ -21,8 +21,6 @@ use crate::app::App;
 use crate::engine::Control;
 use crate::engine::output;
 use crate::settings::Settings;
-use crate::spotify::model::SideEntry;
-use crate::spotify::spot;
 use crate::PORT;
 
 #[derive(RustEmbed)]
@@ -134,17 +132,7 @@ async fn liked(State(app): State<Shared>) -> Answer<Json<Value>> {
 }
 
 async fn playlists(State(app): State<Shared>) -> Answer<Json<Value>> {
-    let session = app.spotify.session().await?;
-    let entries = spot::rootlist(&session).await?;
-    let list: Vec<Value> = entries
-        .into_iter()
-        .filter_map(|e| match e {
-            SideEntry::Folder { name, depth } => Some(json!({ "folder": name, "depth": depth })),
-            SideEntry::Playlist { playlist, depth } => Some(json!({ "id": playlist.id, "name": playlist.name, "owner": playlist.owner, "len": playlist.len, "depth": depth })),
-            _ => None,
-        })
-        .collect();
-    Ok(Json(json!({ "playlists": list })))
+    Ok(Json(json!({ "playlists": app.playlists().await? })))
 }
 
 async fn playlist(State(app): State<Shared>, Path(id): Path<String>) -> Answer<Json<Value>> {
@@ -234,6 +222,7 @@ async fn login_riff(State(app): State<Shared>) -> Answer<Json<Value>> {
 
 async fn logout(State(app): State<Shared>) -> Json<Value> {
     app.spotify.logout();
+    app.forget_lists();
     Json(json!({ "ok": true }))
 }
 
