@@ -1074,34 +1074,136 @@ $('#quit').onclick = async () => {
 };
 
 // ---- keyboard ------------------------------------------------------------------------------
+// The whole set can be played from the laptop: left hand deck 1, right hand
+// deck 2, mirrored. Physical key positions (e.code), so any layout works.
 
-const held = new Set();
+function stemToggle(d, k, solo) {
+  const now = S.engine?.decks[d]?.stems ?? [1, 1, 1, 1];
+  let gains;
+  if (solo) {
+    const only = now.map((_, i) => (i === k ? 1 : 0));
+    gains = now.every((v, i) => v === only[i]) ? [1, 1, 1, 1] : only;
+  } else {
+    gains = now.slice();
+    gains[k] = now[k] > 0.5 ? 0 : 1;
+  }
+  ctl('stems', { d, gains });
+}
+
+function tempoStep(d, dir) {
+  const st = S.engine?.decks[d];
+  if (!st) return;
+  // 0.1% of tempo per press, whatever the range.
+  ctl('pitch', { d, v: Math.max(-1, Math.min(1, st.pitch + (dir * 0.001) / st.range)) });
+}
+
+function bassKill(d) {
+  const low = S.engine?.decks[d]?.eq[0] ?? 0.5;
+  ctl('eq', { d, band: 0, v: low < 0.05 ? 0.5 : 0 });
+}
+
+// [deck, action] for each key; actions with `up` run again on release.
+const KEYS = {
+  KeyQ: [0, 'hot', 0], KeyW: [0, 'hot', 1], KeyE: [0, 'hot', 2], KeyR: [0, 'hot', 3],
+  KeyU: [1, 'hot', 0], KeyI: [1, 'hot', 1], KeyO: [1, 'hot', 2], KeyP: [1, 'hot', 3],
+  KeyA: [0, 'cue'], KeyS: [0, 'play'], KeyD: [0, 'sync'], KeyF: [0, 'loop'],
+  KeyJ: [1, 'cue'], KeyK: [1, 'play'], KeyL: [1, 'sync'], Semicolon: [1, 'loop'],
+  KeyZ: [0, 'nudge', -1], KeyX: [0, 'nudge', 1], KeyN: [1, 'nudge', -1], KeyM: [1, 'nudge', 1],
+  KeyC: [0, 'jump', -4], KeyV: [0, 'jump', 4], Comma: [1, 'jump', -4], Period: [1, 'jump', 4],
+  Digit1: [0, 'stem', 0], Digit2: [0, 'stem', 1], Digit3: [0, 'stem', 2], Digit4: [0, 'stem', 3],
+  Digit7: [1, 'stem', 0], Digit8: [1, 'stem', 1], Digit9: [1, 'stem', 2], Digit0: [1, 'stem', 3],
+  KeyT: [0, 'pfl'], KeyY: [1, 'pfl'], KeyG: [0, 'kill'], KeyH: [1, 'kill'],
+};
+const held = new Map();
+const slide = { left: false, right: false };
+
 document.addEventListener('keydown', (e) => {
   if (e.target.matches('input, select, textarea')) return;
-  if (e.repeat && !['ArrowUp', 'ArrowDown'].includes(e.key)) return;
-  const k = e.key.toLowerCase();
-  if (e.key === 'ArrowDown') { library.move(1); e.preventDefault(); }
-  else if (e.key === 'ArrowUp') { library.move(-1); e.preventDefault(); }
-  else if (e.shiftKey && e.key === 'ArrowLeft') load(0, library.selected());
-  else if (e.shiftKey && e.key === 'ArrowRight') load(1, library.selected());
-  else if (e.key === '/') { $('#search').focus(); e.preventDefault(); }
-  else if (e.key === 'Enter') load(null, library.selected());
-  else if (k === 'z') { held.add('z'); ctl('cue', { d: 0, down: true }); }
-  else if (k === 'x') ctl('play_pause', { d: 0 });
-  else if (k === ',') { held.add(','); ctl('cue', { d: 1, down: true }); }
-  else if (k === '.') ctl('play_pause', { d: 1 });
-  else if ('1234'.includes(k) && k) ctl('hotcue', { d: 0, n: +k - 1, down: true });
-  else if ('7890'.includes(k) && k) ctl('hotcue', { d: 1, n: '7890'.indexOf(k), down: true });
-  else if (e.key === '?') $('#help').hidden = false;
-  else if (e.key === 'Escape') document.querySelectorAll('.overlay:not(#login)').forEach((o) => o.hidden = true);
+  if (e.ctrlKey || e.metaKey || e.altKey) {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'f') { $('#search').focus(); e.preventDefault(); }
+    return;
+  }
+  const code = e.code;
+  // Library and crossfader.
+  if (code === 'ArrowDown' || code === 'ArrowUp') { library.move(code === 'ArrowDown' ? 1 : -1); e.preventDefault(); return; }
+  if (e.repeat) { if (KEYS[code] || code.startsWith('Bracket')) e.preventDefault(); return; }
+  if (e.shiftKey && code === 'ArrowLeft') return load(0, library.selected());
+  if (e.shiftKey && code === 'ArrowRight') return load(1, library.selected());
+  if (code === 'Enter') return load(null, library.selected());
+  if (code === 'Slash' && !e.shiftKey) { $('#search').focus(); e.preventDefault(); return; }
+  if (code === 'Equal') return addToAutoDj([library.selected()]);
+  if (code === 'BracketLeft') { slide.left = true; return; }
+  if (code === 'BracketRight') { slide.right = true; return; }
+  if (code === 'Backslash') return ctl('crossfader', { v: 0.5 });
+  if (code === 'Space') { e.preventDefault(); return; }
+  if (e.key === '?') { $('#help').hidden = false; return; }
+  if (code === 'Escape') { document.querySelectorAll('.overlay:not(#login)').forEach((o) => (o.hidden = true)); return; }
+  const k = KEYS[code];
+  if (!k) return;
+  e.preventDefault();
+  const [d, what, arg] = k;
+  held.set(code, k);
+  switch (what) {
+    case 'hot': ctl(e.shiftKey ? 'hotcue_clear' : 'hotcue', e.shiftKey ? { d, n: arg } : { d, n: arg, down: true }); break;
+    case 'cue': ctl('cue', { d, down: true }); break;
+    case 'play': ctl('play_pause', { d }); break;
+    case 'sync': ctl('sync', { d, on: null }); break;
+    case 'loop': {
+      const lp = S.engine?.decks[d]?.loop;
+      ctl(lp?.active ? 'reloop' : 'auto_loop', lp?.active ? { d } : { d, beats: 4 });
+      break;
+    }
+    case 'nudge': e.shiftKey ? tempoStep(d, arg) : ctl('nudge', { d, v: arg * 0.04 }); break;
+    case 'jump': ctl('beat_jump', { d, beats: arg * (e.shiftKey ? 4 : 1) }); break;
+    case 'stem': stemToggle(d, arg, e.shiftKey); break;
+    case 'pfl': ctl('pfl', { d, on: !S.engine?.decks[d]?.pfl }); break;
+    case 'kill': bassKill(d); break;
+  }
 });
+
 document.addEventListener('keyup', (e) => {
-  const k = e.key.toLowerCase();
-  if (k === 'z' && held.delete('z')) ctl('cue', { d: 0, down: false });
-  else if (k === ',' && held.delete(',')) ctl('cue', { d: 1, down: false });
-  else if ('1234'.includes(k) && k) ctl('hotcue', { d: 0, n: +k - 1, down: false });
-  else if ('7890'.includes(k) && k) ctl('hotcue', { d: 1, n: '7890'.indexOf(k), down: false });
+  if (e.code === 'BracketLeft') slide.left = false;
+  if (e.code === 'BracketRight') slide.right = false;
+  const k = held.get(e.code);
+  if (!k) return;
+  held.delete(e.code);
+  const [d, what, arg] = k;
+  if (what === 'cue') ctl('cue', { d, down: false });
+  if (what === 'hot' && !e.shiftKey) ctl('hotcue', { d, n: arg, down: false });
+  if (what === 'nudge') ctl('nudge', { d, v: 0 });
 });
+
+// Holding [ or ] slides the crossfader (about a second end to end).
+let slideAt = 0;
+(function slider(t) {
+  requestAnimationFrame(slider);
+  const dt = Math.min(0.05, (t - slideAt) / 1000);
+  slideAt = t;
+  if (!S.engine || slide.left === slide.right) return;
+  const v = Math.max(0, Math.min(1, S.engine.crossfader + (slide.right ? 1 : -1) * dt * 1.1));
+  S.engine.crossfader = v;
+  ctl('crossfader', { v });
+})(0);
+
+// The key map, drawn as a keyboard.
+function buildKeyMap() {
+  const rows = [
+    ['Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5', 'Digit6', 'Digit7', 'Digit8', 'Digit9', 'Digit0', 'Minus', 'Equal'],
+    ['KeyQ', 'KeyW', 'KeyE', 'KeyR', 'KeyT', 'KeyY', 'KeyU', 'KeyI', 'KeyO', 'KeyP', 'BracketLeft', 'BracketRight', 'Backslash'],
+    ['KeyA', 'KeyS', 'KeyD', 'KeyF', 'KeyG', 'KeyH', 'KeyJ', 'KeyK', 'KeyL', 'Semicolon', 'Quote'],
+    ['KeyZ', 'KeyX', 'KeyC', 'KeyV', 'KeyB', 'KeyN', 'KeyM', 'Comma', 'Period', 'Slash'],
+  ];
+  const cap = { Digit1: '1', Digit2: '2', Digit3: '3', Digit4: '4', Digit5: '5', Digit6: '6', Digit7: '7', Digit8: '8', Digit9: '9', Digit0: '0', Minus: '-', Equal: '=', BracketLeft: '[', BracketRight: ']', Backslash: '\\', Semicolon: ';', Quote: "'", Comma: ',', Period: '.', Slash: '/' };
+  const what = { hot: (a) => `cue ${a + 1}`, cue: () => 'CUE', play: () => 'PLAY', sync: () => 'SYNC', loop: () => 'loop 4', nudge: (a) => (a < 0 ? 'slower' : 'faster'), jump: (a) => (a < 0 ? '◀ 4' : '4 ▶'), stem: (a) => ['VOX', 'MEL', 'BASS', 'DRUM'][a], pfl: () => 'phones', kill: () => 'bass kill' };
+  const extra = { BracketLeft: 'xfade ◀', BracketRight: 'xfade ▶', Backslash: 'xfade mid', Equal: '+ auto-DJ', Slash: 'search' };
+  return rows.map((row, r) => `<div class="kb-row" style="padding-left:${r * 14}px">${row.map((c) => {
+    const k = KEYS[c];
+    const label = k ? what[k[1]](k[2]) : extra[c] || '';
+    const kind = k ? `d${k[0]}` : extra[c] ? 'mx' : '';
+    return `<div class="kb-key ${kind}"><b>${cap[c] ?? c.replace('Key', '')}</b><span>${label}</span></div>`;
+  }).join('')}</div>`).join('');
+}
+$('#keymap').innerHTML = buildKeyMap();
 
 setInterval(() => {
   const d = new Date();

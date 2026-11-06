@@ -16,6 +16,10 @@ for (const step of steps) {
   if (cmd === 'wait') await page.waitForTimeout(+arg);
   else if (cmd === 'js') await page.evaluate(arg);
   else if (cmd === 'click') await page.click(arg);
+  else if (cmd === 'key') await page.keyboard.press(arg);
+  else if (cmd === 'down') await page.keyboard.down(arg);
+  else if (cmd === 'up') await page.keyboard.up(arg);
+  else if (cmd === 'print') console.log(await page.evaluate(arg));
 }
 await page.screenshot({ path: out });
 console.log(errors.length ? 'console:\n' + errors.join('\n') : 'no console errors');

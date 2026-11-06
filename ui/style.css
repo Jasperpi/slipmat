@@ -359,6 +359,16 @@ nav#sources { overflow-y: auto; padding: 0 6px 10px; flex: 1; }
 .settings-grid select { height: 30px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line-2); padding: 0 8px; max-width: 300px; }
 .settings-grid input[type=checkbox] { accent-color: var(--d0); width: 15px; height: 15px; }
 .help-grid { display: grid; gap: 6px; color: var(--dim); }
+.help-card { width: min(860px, calc(100vw - 32px)); }
+.keymap { display: flex; flex-direction: column; gap: 5px; margin: 14px 0 16px; }
+.kb-row { display: flex; gap: 5px; }
+.kb-key { width: 58px; height: 50px; border-radius: 7px; background: var(--panel-2); border: 1px solid var(--line); display: flex; flex-direction: column; justify-content: space-between; padding: 4px 6px; }
+.kb-key b { font: 700 12px var(--mono); color: var(--faint); }
+.kb-key span { font: 600 10px var(--sans); color: var(--text); line-height: 1.1; }
+.kb-key.d0 { border-color: color-mix(in srgb, var(--d0) 55%, var(--line)); background: color-mix(in srgb, var(--d0) 12%, var(--panel-2)); }
+.kb-key.d1 { border-color: color-mix(in srgb, var(--d1) 55%, var(--line)); background: color-mix(in srgb, var(--d1) 12%, var(--panel-2)); }
+.kb-key.mx { border-color: color-mix(in srgb, var(--sync) 45%, var(--line)); }
+.kb-key.d0 b, .kb-key.d1 b, .kb-key.mx b { color: var(--dim); }
 kbd { font: 600 11px var(--mono); padding: 1px 5px; border-radius: 4px; background: var(--panel-3); border: 1px solid var(--line-2); color: var(--text); }
 
 .toasts { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 8px; z-index: 30; align-items: center; pointer-events: none; }
