@@ -6,9 +6,18 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
-    if !linux {
-        return;
+    if linux {
+        link_libstdcpp();
     }
+}
+
+/// Only a Linux build ever needs this, and this script itself is compiled for
+/// the computer doing the building, so the Unix-only parts stay out elsewhere.
+#[cfg(not(unix))]
+fn link_libstdcpp() {}
+
+#[cfg(unix)]
+fn link_libstdcpp() {
     // ONNX Runtime is C++, so linking it needs libstdc++. Most systems have
     // the library (everything written in C++ uses it) but only under its
     // versioned name; the plain name the linker asks for arrives with a C++
