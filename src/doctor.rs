@@ -1,0 +1,222 @@
+//! `slipmat doctor`: live checks that never make a sound and never touch
+//! what the Spotify account is playing elsewhere.
+
+use std::time::{Duration, Instant};
+
+use anyhow::{Result, anyhow};
+use librespot_protocol::extension_kind::ExtensionKind;
+
+use crate::analysis;
+use crate::engine::output;
+use crate::loader;
+use crate::session::{Login, Spotify};
+use crate::spotify::spot;
+use crate::track::SRC_RATE;
+
+const G: &str = "\x1b[32m✓\x1b[0m";
+const X: &str = "\x1b[31m✗\x1b[0m";
+
+fn value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+}
+
+async fn signed_in() -> Result<std::sync::Arc<Spotify>> {
+    let spotify = Spotify::new();
+    spotify.resume();
+    if matches!(spotify.login(), Login::SignedOut { riff: true }) {
+        println!("  using riff's saved Spotify login");
+        spotify.use_riff()?;
+    }
+    let mut rx = spotify.watch_login();
+    let wait = async {
+        loop {
+            match rx.borrow_and_update().clone() {
+                Login::Online { user } => return Ok(user),
+                Login::Failed { message } => return Err(anyhow!(message)),
+                Login::SignedOut { .. } => return Err(anyhow!("not signed in: run slipmat and sign in")),
+                _ => {}
+            }
+            rx.changed().await?;
+        }
+    };
+    let user: String = tokio::time::timeout(Duration::from_secs(25), wait).await.map_err(|_| anyhow!("Spotify didn't answer"))??;
+    println!("{G} Spotify: signed in as {user}");
+    Ok(spotify)
+}
+
+pub async fn run(args: &[String]) -> Result<()> {
+    if let Some(q) = value(args, "--load") {
+        return load(q).await;
+    }
+    if args.iter().any(|a| a == "--fake-ddj") {
+        return fake_ddj();
+    }
+    if let Some(q) = value(args, "--attrs") {
+        return attrs(q).await;
+    }
+    println!("Sound cards:");
+    for d in output::devices() {
+        println!("  {} {} ({} channels){}", if d.controller { "🎛" } else { "·" }, d.name, d.channels, if d.controller { "  ← controller" } else { "" });
+    }
+    println!("MIDI inputs:");
+    match midir::MidiInput::new("slipmat-doctor") {
+        Ok(m) => {
+            let ports = m.ports();
+            if ports.is_empty() {
+                println!("  (none)");
+            }
+            for p in &ports {
+                println!("  · {}", m.port_name(p).unwrap_or_default());
+            }
+        }
+        Err(e) => println!("  {X} {e}"),
+    }
+    signed_in().await?;
+    Ok(())
+}
+
+async fn attrs(q: &str) -> Result<()> {
+    let spotify = signed_in().await?;
+    let session = spotify.session().await?;
+    let uris = spot::search_tracks(&session, q).await?;
+    let uri = uris.first().ok_or_else(|| anyhow!("nothing found"))?.clone();
+    for kind in [ExtensionKind::AUDIO_ATTRIBUTES, ExtensionKind::TRACK_EXTRA_AUDIO_ATTRIBUTES] {
+        let (got, ok) = spot::batch(&session, kind, &[uri.clone()]).await;
+        println!("{kind:?}: answered={ok} entries={}", got.len());
+        for (u, bytes) in got {
+            println!("  {u}: {} bytes {:02x?}", bytes.len(), &bytes[..bytes.len().min(96)]);
+        }
+    }
+    Ok(())
+}
+
+async fn load(queries: &str) -> Result<()> {
+    let spotify = signed_in().await?;
+    let session = spotify.session().await?;
+    for q in queries.split('|') {
+        load_one(&session, q.trim()).await?;
+    }
+    Ok(())
+}
+
+async fn load_one(session: &librespot_core::Session, q: &str) -> Result<()> {
+    let session = session.clone();
+    let uris = spot::search_tracks(&session, q).await?;
+    let tracks = spot::tracks(&session, &uris[..uris.len().min(10)]).await;
+    let track = tracks.into_iter().find(|t| t.playable).ok_or_else(|| anyhow!("no playable song for {q:?}"))?;
+    println!("  {} · {} ({:.0} s)", track.name, track.artist_line(), track.duration_ms as f64 / 1000.0);
+    let started = Instant::now();
+    let audio = loader::load(&session, &track.uri, track.duration_ms)?;
+    let mut first_audio = None;
+    loop {
+        if first_audio.is_none() && audio.len() > SRC_RATE as usize {
+            first_audio = Some(started.elapsed());
+        }
+        if audio.done.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
+        if audio.failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(anyhow!("decode failed"));
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            return Err(anyhow!("decode took over two minutes"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let took = started.elapsed();
+    let secs = audio.len() as f64 / SRC_RATE;
+    println!(
+        "{G} decoded {secs:.1} s of audio in {:.1} s ({:.0}× real time); first second playable after {:.2} s",
+        took.as_secs_f64(),
+        secs / took.as_secs_f64(),
+        first_audio.map_or(0.0, |d| d.as_secs_f64())
+    );
+    let mut bands: [Vec<u8>; 4] = Default::default();
+    for i in 0..audio.wave_len() {
+        let c = audio.column(i);
+        for (b, v) in [c.low, c.mid, c.high, c.peak].into_iter().enumerate() {
+            bands[b].push(v);
+        }
+    }
+    let pct = |v: &mut Vec<u8>, p: f64| {
+        v.sort();
+        v.get(((v.len() as f64 - 1.0) * p) as usize).copied().unwrap_or(0)
+    };
+    let summary: Vec<String> = ["low", "mid", "high", "peak"].iter().zip(bands.iter_mut()).map(|(n, v)| format!("{n} p50 {} p95 {}", pct(v, 0.5), pct(v, 0.95))).collect();
+    println!("{G} waveform: {} columns ({})", audio.wave_len(), summary.join(", "));
+    let t = Instant::now();
+    let mono = audio.mono();
+    let a = tokio::task::spawn_blocking(move || analysis::analyse(&mono)).await?.ok_or_else(|| anyhow!("too short to analyse"))?;
+    println!(
+        "{G} analysis in {:.2} s: {:.2} BPM (confidence {:.2}), key {} / {}, loudness {:.1} dB, first beat at {:.3} s, music starts {:.3} s",
+        t.elapsed().as_secs_f64(),
+        a.bpm,
+        a.confidence,
+        a.key.map(analysis::key_name).unwrap_or("?".into()),
+        a.key.map(analysis::camelot).unwrap_or("?".into()),
+        a.loudness_db,
+        a.anchor / SRC_RATE,
+        a.first_sound / SRC_RATE
+    );
+    let mono = audio.mono();
+    let drift = analysis::grid_drift(&mono, &a);
+    println!("  kicks vs grid (median ms, start/middle/end): {:+.1} {:+.1} {:+.1}", drift[0], drift[1], drift[2]);
+    Ok(())
+}
+
+/// Pretend to be a DDJ-FLX4 (virtual MIDI ports), for testing the mapping
+/// against a running Slipmat without the hardware.
+fn fake_ddj() -> Result<()> {
+    use midir::os::unix::{VirtualInput, VirtualOutput};
+    use std::sync::{Arc, Mutex};
+    let lights: Arc<Mutex<Vec<[u8; 3]>>> = Arc::default();
+    let seen = lights.clone();
+    let _input = midir::MidiInput::new("fake-ddj")?
+        .create_virtual("DDJ-FLX4 fake", move |_, m, _| {
+            if m.len() == 3 {
+                seen.lock().unwrap().push([m[0], m[1], m[2]]);
+            }
+        }, ())
+        .map_err(|e| anyhow!("{e}"))?;
+    let mut out = midir::MidiOutput::new("fake-ddj")?.create_virtual("DDJ-FLX4 fake").map_err(|e| anyhow!("{e}"))?;
+    println!("fake DDJ-FLX4 up; waiting for Slipmat to find it…");
+    std::thread::sleep(Duration::from_secs(5));
+    let mut send = |m: &[u8]| {
+        let _ = out.send(m);
+        std::thread::sleep(Duration::from_millis(30));
+    };
+    // Deck 1: fader full, crossfader centre, low EQ killed, play.
+    send(&[0xB0, 0x13, 0x7F]);
+    send(&[0xB0, 0x33, 0x7F]);
+    send(&[0xB6, 0x1F, 0x40]);
+    send(&[0xB6, 0x3F, 0x00]);
+    send(&[0xB0, 0x0F, 0x00]);
+    send(&[0xB0, 0x2F, 0x00]);
+    send(&[0x90, 0x0B, 0x7F]);
+    send(&[0x90, 0x0B, 0x00]);
+    std::thread::sleep(Duration::from_millis(1500));
+    // Hot cue 1 on deck 1, a 4-beat loop from the pads, headphone cue.
+    send(&[0x97, 0x00, 0x7F]);
+    send(&[0x97, 0x00, 0x00]);
+    send(&[0x97, 0x64, 0x7F]);
+    send(&[0x97, 0x64, 0x00]);
+    send(&[0x90, 0x54, 0x7F]);
+    send(&[0x90, 0x54, 0x00]);
+    // Scratch: touch, turn back half a turn, let go.
+    send(&[0x90, 0x36, 0x7F]);
+    for _ in 0..30 {
+        send(&[0xB0, 0x22, 0x40 - 12]);
+    }
+    send(&[0x90, 0x36, 0x00]);
+    // Browse knob and load button.
+    send(&[0xB6, 0x40, 0x01]);
+    send(&[0x96, 0x47, 0x7F]);
+    send(&[0x96, 0x47, 0x00]);
+    std::thread::sleep(Duration::from_millis(1500));
+    let got = lights.lock().unwrap().clone();
+    println!("{} light messages back from Slipmat", got.len());
+    let find = |s: u8, d: u8| got.iter().rev().find(|m| m[0] == s && m[1] == d).map(|m| m[2]);
+    println!("  play deck 1: {:?}  hot cue pad 1: {:?}  4-beat loop pad: {:?}  headphone cue: {:?}  VU deck 1: {:?}",
+        find(0x90, 0x0B), find(0x97, 0x00), find(0x97, 0x64), find(0x90, 0x54), find(0xB0, 0x02));
+    Ok(())
+}

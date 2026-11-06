@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slipmat</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='15' fill='%23141518'/%3E%3Ccircle cx='16' cy='16' r='11' fill='none' stroke='%23ff6a3d' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='3' fill='%23ff6a3d'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="disc"></span>slipmat</div>
+  <div class="fxbar" id="fxbar"></div>
+  <div class="pills">
+    <span class="pill" id="pill-controller" title="Controller">No controller</span>
+    <span class="pill" id="pill-output" title="Sound output">Audio…</span>
+    <span class="pill" id="pill-spotify" title="Spotify">Spotify…</span>
+    <span class="pill quiet" id="pill-batch" hidden></span>
+  </div>
+  <div class="top-right">
+    <div class="master-meter" title="Master level"><i id="mm-l"></i><i id="mm-r"></i></div>
+    <span class="clock" id="clock">--:--</span>
+    <button class="icon" id="open-help" title="Keyboard shortcuts">?</button>
+    <button class="icon" id="open-settings" title="Settings">⚙</button>
+  </div>
+</header>
+
+<section class="lanes" id="lanes">
+  <canvas id="lane-canvas"></canvas>
+  <div class="lane-zoom">
+    <button id="zoom-out" title="Zoom out">−</button>
+    <button id="zoom-in" title="Zoom in">+</button>
+  </div>
+</section>
+
+<main class="stage">
+  <section class="deck" id="deck-0" data-d="0"></section>
+  <section class="mixer" id="mixer"></section>
+  <section class="deck" id="deck-1" data-d="1"></section>
+</main>
+
+<section class="library" id="library">
+  <aside class="sources">
+    <label class="search">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+      <input id="search" type="search" placeholder="Search Spotify" autocomplete="off" spellcheck="false">
+    </label>
+    <nav id="sources">
+      <button class="source active" data-src="liked">♥ Liked Songs</button>
+      <div class="source-head">Playlists</div>
+      <div id="playlists"><div class="hint">Sign in to see your playlists</div></div>
+    </nav>
+  </aside>
+  <div class="tracks">
+    <div class="tracks-head">
+      <h2 id="list-title">Liked Songs</h2>
+      <input id="filter" type="search" placeholder="Filter this list" autocomplete="off" spellcheck="false">
+      <button class="small" id="analyze-list" title="Work out BPM and key for every song in this list">Analyze list</button>
+      <span class="count" id="list-count"></span>
+    </div>
+    <div class="table" id="table">
+      <div class="row head">
+        <span class="c-art"></span>
+        <span class="c-title sort" data-sort="name">Title</span>
+        <span class="c-artist sort" data-sort="artist">Artist</span>
+        <span class="c-bpm sort" data-sort="bpm">BPM</span>
+        <span class="c-key sort" data-sort="key">Key</span>
+        <span class="c-time sort" data-sort="duration_ms">Time</span>
+        <span class="c-album sort" data-sort="album">Album</span>
+        <span class="c-load"></span>
+      </div>
+      <div class="rows" id="rows"></div>
+    </div>
+  </div>
+</section>
+
+<div class="overlay" id="login" hidden>
+  <div class="card login-card">
+    <div class="brand big"><span class="disc"></span>slipmat</div>
+    <p class="lede">Two decks, your Spotify, your Pioneer board.</p>
+    <p class="fine">Slipmat plays Spotify songs with your Premium account. It never touches what you're playing on your phone or other devices.</p>
+    <div class="login-actions">
+      <button class="primary" id="login-browser">Connect Spotify</button>
+      <button id="login-riff" hidden>Use my riff login</button>
+    </div>
+    <p class="fine" id="login-status"></p>
+  </div>
+</div>
+
+<div class="overlay" id="settings" hidden>
+  <div class="card settings-card">
+    <div class="card-head"><h3>Settings</h3><button class="icon" data-close>✕</button></div>
+    <div class="settings-grid">
+      <h4>Sound</h4>
+      <label>Output <select id="set-device"></select></label>
+      <label>Master on channels <select id="set-master"><option value="0,1">1 – 2</option><option value="2,3">3 – 4</option></select></label>
+      <label>Headphones <select id="set-cue"><option value="2,3">Channels 3 – 4 (DDJ headphone jack)</option><option value="split">Split: cue left, master right</option><option value="none">None</option></select></label>
+      <label>Buffer <select id="set-buffer"><option>128</option><option>256</option><option>512</option><option>1024</option></select></label>
+      <p class="fine" id="set-output-status"></p>
+      <h4>Decks</h4>
+      <label class="check"><input type="checkbox" id="set-keylock"> Key lock on new songs (tempo changes keep the pitch)</label>
+      <label class="check"><input type="checkbox" id="set-quantize"> Quantize (hot cues, loops and jumps land on the beat)</label>
+      <label class="check"><input type="checkbox" id="set-autogain"> Auto gain (every song starts at the same loudness)</label>
+      <label class="check"><input type="checkbox" id="set-vinyl"> Vinyl mode (touching a jog wheel scratches)</label>
+      <label class="check"><input type="checkbox" id="set-invert"> Invert the tempo faders</label>
+      <label>Default tempo range <select id="set-range"><option value="0.06">±6%</option><option value="0.08">±8%</option><option value="0.1">±10%</option><option value="0.16">±16%</option><option value="0.5">±50%</option></select></label>
+      <label class="check"><input type="checkbox" id="set-camelot"> Show keys as Camelot codes (8A) instead of names (Am)</label>
+      <h4>Account</h4>
+      <p class="fine" id="set-account"></p>
+      <button class="small" id="logout">Sign out of Spotify</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="help" hidden>
+  <div class="card help-card">
+    <div class="card-head"><h3>Shortcuts</h3><button class="icon" data-close>✕</button></div>
+    <div class="help-grid">
+      <div><kbd>↑</kbd><kbd>↓</kbd> move in the list</div>
+      <div><kbd>Shift</kbd>+<kbd>←</kbd> load onto deck 1 · <kbd>Shift</kbd>+<kbd>→</kbd> deck 2</div>
+      <div><kbd>/</kbd> search Spotify</div>
+      <div><kbd>Z</kbd> cue · <kbd>X</kbd> play deck 1</div>
+      <div><kbd>,</kbd> cue · <kbd>.</kbd> play deck 2</div>
+      <div><kbd>1</kbd>–<kbd>4</kbd> hot cues deck 1 · <kbd>7</kbd>–<kbd>0</kbd> deck 2</div>
+      <div>Drag a song onto a deck to load it</div>
+      <div>Drag the big waveform to scratch; click the small one to jump</div>
+      <div>Right-click a hot cue to delete it</div>
+      <div>Double-click a knob or fader to reset it</div>
+    </div>
+    <h4>On the controller</h4>
+    <div class="help-grid">
+      <div>Browse knob scrolls the list, LOAD loads the highlighted song</div>
+      <div>PAD FX modes: hold a pad for roll, echo, trans and more</div>
+      <div>Hold LOOP IN for a 4-beat loop · CUE/LOOP CALL ◀▶ halve/double</div>
+      <div>SHIFT + BEAT SYNC changes the tempo range</div>
+      <div>SHIFT + headphone CUE toggles key lock</div>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script type="module" src="app.js"></script>
+</body>
+</html>

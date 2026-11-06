@@ -1,0 +1,46 @@
+[package]
+name = "slipmat"
+version = "0.1.0"
+edition = "2024"
+description = "A free DJ app: Spotify on two decks, played through a Pioneer DDJ controller"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
+cpal = "0.16"
+crossbeam-channel = "0.5"
+dirs = "6"
+futures = "0.3"
+librespot-core = "0.8"
+librespot-metadata = "0.8"
+librespot-playback = "0.8"
+librespot-protocol = "0.8"
+log = { version = "0.4", features = ["std"] }
+midir = "0.10"
+mime_guess = "2"
+protobuf = "3.7"
+rand = "0.9"
+reqwest = { version = "0.12", features = ["json"] }
+rust-embed = "8"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net", "io-util"] }
+
+[profile.dev]
+opt-level = 1
+debug = false
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+debug = false
+strip = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only to quiet ALSA's console chatter about devices this machine lacks.
+alsa-sys = "0.3"
