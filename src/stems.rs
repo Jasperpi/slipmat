@@ -8,9 +8,14 @@
 //! the original sound four ways. The masks always add up to one, so the four
 //! stems add back up to the original song exactly.
 //!
-//! A song is worked through in 12-second pieces, in order, so the stems for
-//! the start are ready within a second and the rest follow (a whole song takes
-//! about ten seconds). Nothing is written to disk but the model files.
+//! A song is worked through in pieces, in order, so the stems for the start
+//! are ready within a second and the rest follow (a whole song takes about
+//! ten seconds). Nothing is written to disk but the model files.
+//!
+//! On a computer with memory to spare (12 GB or more), Meta's Demucs
+//! (HT-Demucs, MIT) is used instead: much cleaner stems, at about a gigabyte
+//! of memory while it works. On Windows it runs on the graphics card through
+//! DirectML when there is one.
 //!
 //! Decks and the interface order the stems vocals, melody, bass, drums.
 
@@ -37,9 +42,67 @@ const FULL: usize = N / 2 + 1;
 /// A periodic Hann window, squared and overlapped at a quarter hop, sums to this.
 const OLA_GAIN: f32 = 1.5;
 
-/// The model files, in the networks' own order.
+/// Spleeter's model files, in the networks' own order.
 const MODELS: [&str; 4] = ["vocals", "drums", "bass", "other"];
 const MODEL_URL: &str = "https://huggingface.co/Best-Practice/spleeter-4stems-onnx/resolve/main";
+
+/// HT-Demucs, exported to ONNX whole (its STFT included): stereo audio in,
+/// [drums, bass, other, vocals] out, 7.8 s at a time.
+const DEMUCS_FILE: &str = "htdemucs_fp16weights.onnx";
+const DEMUCS_URL: &str = "https://huggingface.co/StemSplitio/htdemucs-onnx/resolve/main/htdemucs_fp16weights.onnx";
+const DEMUCS_LEN: usize = 343_980;
+
+/// Which separation the user wants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Quality {
+    /// Demucs where the computer can take it, Spleeter elsewhere.
+    #[default]
+    Auto,
+    /// Spleeter: about ten seconds a song, 400 MB.
+    Fast,
+    /// Demucs: cleaner, needs about a gigabyte free.
+    Best,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Model {
+    Spleeter,
+    Demucs,
+}
+
+/// Total memory in this computer, GB.
+pub fn ram_gb() -> f64 {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_memory();
+    sys.total_memory() as f64 / 1e9
+}
+
+impl Model {
+    pub fn choose(q: Quality) -> Self {
+        match q {
+            Quality::Fast => Model::Spleeter,
+            Quality::Best => Model::Demucs,
+            // 8 GB machines (like the laptop this was built on) run out of
+            // memory with Demucs; 16 GB ones manage easily.
+            Quality::Auto => {
+                if ram_gb() >= 12.0 {
+                    Model::Demucs
+                } else {
+                    Model::Spleeter
+                }
+            }
+        }
+    }
+
+    fn files(self) -> Vec<(PathBuf, String)> {
+        match self {
+            Model::Spleeter => MODELS.iter().map(|m| (model_path(m), format!("{MODEL_URL}/{m}.wide.fp16.onnx"))).collect(),
+            Model::Demucs => vec![(model_dir().join(DEMUCS_FILE), DEMUCS_URL.to_string())],
+        }
+    }
+}
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -78,6 +141,7 @@ pub struct Stems {
     status: AtomicU8,
     /// Set when the song leaves the deck: stop working on it.
     pub cancelled: AtomicBool,
+    pub model: Model,
 }
 
 fn atomics(n: usize) -> Box<[AtomicI16]> {
@@ -87,7 +151,7 @@ fn atomics(n: usize) -> Box<[AtomicI16]> {
 }
 
 impl Stems {
-    pub fn for_track(track: &TrackAudio) -> Self {
+    pub fn for_track(track: &TrackAudio, model: Model) -> Self {
         let cap = track.expected + SRC_RATE as usize * 4;
         Self {
             data: [atomics(cap * 2), atomics(cap * 2), atomics(cap * 2)],
@@ -95,6 +159,7 @@ impl Stems {
             ready: AtomicUsize::new(0),
             status: AtomicU8::new(Status::Waiting as u8),
             cancelled: AtomicBool::new(false),
+            model,
         }
     }
 
@@ -131,7 +196,7 @@ impl Stems {
 impl Stems {
     /// Stems with known contents, for tests: `parts[stem](frame) -> (l, r)`.
     pub fn filled(track: &TrackAudio, parts: [&dyn Fn(usize) -> (f32, f32); 3]) -> Self {
-        let s = Self::for_track(track);
+        let s = Self::for_track(track, Model::Spleeter);
         for i in 0..track.len() {
             for (k, f) in parts.iter().enumerate() {
                 let (l, r) = f(i);
@@ -155,37 +220,36 @@ fn model_path(name: &str) -> PathBuf {
     model_dir().join(format!("spleeter-{name}.wide.fp16.onnx"))
 }
 
-pub fn models_present() -> bool {
-    MODELS.iter().all(|m| model_path(m).exists())
+pub fn models_present(model: Model) -> bool {
+    model.files().iter().all(|(p, _)| p.exists())
 }
 
-/// Fetch the four networks (about 80 MB) the first time stems are used.
-pub async fn download_models() -> Result<()> {
+/// Fetch a model the first time it is used (Spleeter about 80 MB, Demucs 166 MB).
+pub async fn download_models(model: Model) -> Result<()> {
     std::fs::create_dir_all(model_dir())?;
     let client = reqwest::Client::new();
-    for m in MODELS {
-        let path = model_path(m);
+    for (path, url) in model.files() {
         if path.exists() {
             continue;
         }
-        let url = format!("{MODEL_URL}/{m}.wide.fp16.onnx");
-        let resp = client.get(&url).timeout(Duration::from_secs(300)).send().await?;
+        let resp = client.get(&url).timeout(Duration::from_secs(900)).send().await?;
         if !resp.status().is_success() {
-            return Err(anyhow!("couldn't download the {m} stem model ({})", resp.status()));
+            return Err(anyhow!("couldn't download {} ({})", url, resp.status()));
         }
         let bytes = resp.bytes().await?;
         if bytes.len() < 1_000_000 {
-            return Err(anyhow!("the {m} stem model came back too small"));
+            return Err(anyhow!("{} came back too small", url));
         }
         let tmp = path.with_extension("part");
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &path)?;
-        log::info!("downloaded stem model {m} ({} MB)", bytes.len() / 1_000_000);
+        log::info!("downloaded {} ({} MB)", path.display(), bytes.len() / 1_000_000);
     }
     Ok(())
 }
 
 struct Nets {
+    model: Model,
     sessions: Vec<ort::session::Session>,
     last_used: Instant,
 }
@@ -194,24 +258,57 @@ fn ort_err(e: impl std::fmt::Display) -> anyhow::Error {
     anyhow!("stem model: {e}")
 }
 
-fn load_nets() -> Result<Nets> {
-    let mut sessions = Vec::new();
-    for m in MODELS {
-        // No memory arena: an arena keeps its high-water mark for good, and
-        // four of them would hold most of a gigabyte between songs.
-        let s = ort::session::Session::builder()
-            .map_err(ort_err)?
-            .with_execution_providers([ort::ep::CPU::default().with_arena_allocator(false).build()])
-            .map_err(ort_err)?
-            .with_memory_pattern(false)
-            .map_err(ort_err)?
-            .with_intra_threads(3)
-            .map_err(ort_err)?
-            .commit_from_file(model_path(m))
-            .map_err(ort_err)?;
-        sessions.push(s);
+fn session(path: PathBuf, threads: usize, gpu: bool, optimise: bool) -> Result<ort::session::Session> {
+    // No memory arena: an arena keeps its high-water mark for good, and
+    // would hold most of a gigabyte between songs.
+    let mut providers = Vec::new();
+    #[cfg(windows)]
+    if gpu {
+        // The graphics card, through DirectML; ONNX Runtime falls back to the
+        // processor if there isn't a usable one.
+        providers.push(ort::ep::DirectML::default().build());
     }
-    Ok(Nets { sessions, last_used: Instant::now() })
+    let _ = gpu;
+    providers.push(ort::ep::CPU::default().with_arena_allocator(false).build());
+    // Demucs is loaded without graph optimisation: optimising it briefly
+    // takes over 2 GB, unoptimised it peaks under 1 GB and runs about as fast.
+    let level = if optimise {
+        ort::session::builder::GraphOptimizationLevel::Level3
+    } else {
+        ort::session::builder::GraphOptimizationLevel::Disable
+    };
+    ort::session::Session::builder()
+        .map_err(ort_err)?
+        .with_optimization_level(level)
+        .map_err(ort_err)?
+        .with_execution_providers(providers)
+        .map_err(ort_err)?
+        .with_memory_pattern(false)
+        .map_err(ort_err)?
+        .with_intra_threads(threads)
+        .map_err(ort_err)?
+        .commit_from_file(path)
+        .map_err(ort_err)
+}
+
+fn load_nets(model: Model) -> Result<Nets> {
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let sessions = match model {
+        Model::Spleeter => MODELS.iter().map(|m| session(model_path(m), 3, false, true)).collect::<Result<Vec<_>>>()?,
+        // Leave a couple of cores for the decks and the interface.
+        Model::Demucs => vec![session(model_dir().join(DEMUCS_FILE), cores.saturating_sub(2).max(2), true, false)?],
+    };
+    log::info!("stem model {model:?} loaded");
+    Ok(Nets { model, sessions, last_used: Instant::now() })
+}
+
+/// The loaded networks for `model`, loading (or swapping) them if needed.
+fn nets_for(guard: &mut Option<Nets>, model: Model) -> Result<&mut Nets> {
+    if guard.as_ref().is_none_or(|n| n.model != model) {
+        *guard = None; // let the other model go first
+        *guard = Some(load_nets(model)?);
+    }
+    Ok(guard.as_mut().expect("loaded above"))
 }
 
 /// The networks stay loaded between songs (about 200 MB), and are let go
@@ -233,6 +330,131 @@ pub fn release_idle() {
 pub fn separate(track: &TrackAudio, stems: &Stems) -> Result<()> {
     let started = Instant::now();
     stems.set_status(Status::Separating);
+    let finished = match stems.model {
+        Model::Spleeter => spleeter(track, stems)?,
+        Model::Demucs => demucs(track, stems)?,
+    };
+    if finished {
+        stems.ready.store(track.len(), Ordering::Release);
+        stems.set_status(Status::Done);
+        log::info!(
+            "stems ({:?}): {:.0} s of song separated in {:.1} s",
+            stems.model,
+            track.len() as f64 / SRC_RATE,
+            started.elapsed().as_secs_f64()
+        );
+    } else {
+        stems.set_status(Status::Off);
+    }
+    Ok(())
+}
+
+/// Wait until `track` has decoded `need` frames (or finished). False if the
+/// song failed or left the deck meanwhile. The model lock is let go while waiting.
+fn wait_for<'a>(
+    track: &TrackAudio,
+    stems: &Stems,
+    need: usize,
+    mut guard: std::sync::MutexGuard<'a, Option<Nets>>,
+) -> Option<std::sync::MutexGuard<'a, Option<Nets>>> {
+    loop {
+        if stems.cancelled.load(Ordering::Relaxed) || track.failed.load(Ordering::Acquire) {
+            return None;
+        }
+        if track.done.load(Ordering::Acquire) || track.len() >= need {
+            return Some(guard);
+        }
+        drop(guard);
+        std::thread::sleep(Duration::from_millis(50));
+        guard = NETS.lock().unwrap();
+    }
+}
+
+/// Demucs: 7.8-second pieces overlapping by a quarter, crossfaded.
+fn demucs(track: &TrackAudio, stems: &Stems) -> Result<bool> {
+    let n = DEMUCS_LEN;
+    let overlap = n / 4;
+    let stride = n - overlap;
+    let window: Vec<f32> = (0..n)
+        .map(|i| {
+            let fade = |k: usize| k as f32 / (overlap - 1) as f32;
+            if i < overlap { fade(i) } else if i >= n - overlap { fade(n - 1 - i) } else { 1.0 }
+        })
+        .collect();
+    // Kept stems in Demucs's own order: vocals 3, drums 0, bass 1.
+    const KEEP: [usize; 3] = [3, 0, 1];
+    let mut acc = vec![0.0f32; 3 * 2 * n];
+    let mut weight = vec![0.0f32; n];
+    let mut input = vec![0.0f32; 2 * n];
+    let mut guard = NETS.lock().unwrap();
+    let mut start = 0usize;
+    loop {
+        guard = match wait_for(track, stems, start + n, guard) {
+            Some(g) => g,
+            None => return Ok(false),
+        };
+        let done = track.done.load(Ordering::Acquire);
+        let len = track.len();
+        if done && start >= len && start > 0 {
+            break;
+        }
+        let end = if done { (start + n).min(len) } else { start + n };
+        let clen = end - start;
+        for k in 0..n {
+            let (l, r) = if k < clen { track.frame(start + k, len) } else { (0.0, 0.0) };
+            input[k] = l;
+            input[n + k] = r;
+        }
+        let nets = nets_for(&mut guard, Model::Demucs)?;
+        let tensor = ort::value::Tensor::from_array(([1usize, 2, n], input.clone())).map_err(ort_err)?;
+        let out = nets.sessions[0].run(ort::inputs!["mix" => tensor]).map_err(ort_err)?;
+        let (_, y) = out["stems"].try_extract_tensor::<f32>().map_err(ort_err)?;
+        if y.len() != 4 * 2 * n {
+            return Err(anyhow!("Demucs answered with {} values, expected {}", y.len(), 8 * n));
+        }
+        for (slot, &src) in KEEP.iter().enumerate() {
+            for c in 0..2 {
+                let from = &y[(src * 2 + c) * n..(src * 2 + c) * n + clen];
+                let to = &mut acc[(slot * 2 + c) * n..(slot * 2 + c) * n + clen];
+                for k in 0..clen {
+                    to[k] += from[k] * window[k];
+                }
+            }
+        }
+        for k in 0..clen {
+            weight[k] += window[k];
+        }
+        drop(out);
+        nets.last_used = Instant::now();
+        // Everything before the next piece starts is final.
+        let last = done && end >= len;
+        let fin = if last { clen } else { stride };
+        for slot in 0..3 {
+            for c in 0..2 {
+                let a = &acc[(slot * 2 + c) * n..(slot * 2 + c + 1) * n];
+                for k in 0..fin {
+                    stems.write(slot, c, start + k, a[k] / weight[k].max(1e-8));
+                }
+            }
+        }
+        stems.ready.store(start + fin, Ordering::Release);
+        if last {
+            break;
+        }
+        for slot in 0..6 {
+            let a = &mut acc[slot * n..(slot + 1) * n];
+            a.copy_within(stride.., 0);
+            a[overlap..].fill(0.0);
+        }
+        weight.copy_within(stride.., 0);
+        weight[overlap..].fill(0.0);
+        start += stride;
+    }
+    Ok(true)
+}
+
+/// Spleeter: the song's spectrum in 512-frame (12 s) pieces, four networks, masks.
+fn spleeter(track: &TrackAudio, stems: &Stems) -> Result<bool> {
     let mut guard = NETS.lock().unwrap();
     let mut planner = FftPlanner::<f32>::new();
     let fwd = planner.plan_fft_forward(N);
@@ -248,30 +470,14 @@ pub fn separate(track: &TrackAudio, stems: &Stems) -> Result<()> {
     let mut buf = vec![Complex32::new(0.0, 0.0); N];
     let mut split = 0usize;
     loop {
-        if stems.cancelled.load(Ordering::Relaxed) {
-            stems.set_status(Status::Off);
-            return Ok(());
-        }
         // Wait until the audio this piece reads has decoded.
         let first = split * SPLIT;
         let need = ((first + SPLIT) * HOP + N).saturating_sub(PAD);
-        loop {
-            let done = track.done.load(Ordering::Acquire);
-            if done || track.len() >= need {
-                break;
-            }
-            if track.failed.load(Ordering::Acquire) || stems.cancelled.load(Ordering::Relaxed) {
-                stems.set_status(Status::Off);
-                return Ok(());
-            }
-            drop(guard);
-            std::thread::sleep(Duration::from_millis(50));
-            guard = NETS.lock().unwrap();
-        }
-        if guard.is_none() {
-            *guard = Some(load_nets()?);
-        }
-        let nets = guard.as_mut().expect("loaded above");
+        guard = match wait_for(track, stems, need, guard) {
+            Some(g) => g,
+            None => return Ok(false),
+        };
+        let nets = nets_for(&mut guard, Model::Spleeter)?;
         let done = track.done.load(Ordering::Acquire);
         let len = track.len();
         let frames_total = (PAD + len).div_ceil(HOP);
@@ -381,18 +587,15 @@ pub fn separate(track: &TrackAudio, stems: &Stems) -> Result<()> {
             break;
         }
     }
-    stems.ready.store(track.len(), Ordering::Release);
-    stems.set_status(Status::Done);
-    log::info!("stems: {:.0} s of song separated in {:.1} s", track.len() as f64 / SRC_RATE, started.elapsed().as_secs_f64());
-    Ok(())
+    Ok(true)
 }
 
 /// Separate in the background, after making sure the models are here.
 pub fn spawn(track: Arc<TrackAudio>, stems: Arc<Stems>) {
     tokio::spawn(async move {
-        if !models_present() {
+        if !models_present(stems.model) {
             stems.set_status(Status::Downloading);
-            if let Err(e) = download_models().await {
+            if let Err(e) = download_models(stems.model).await {
                 log::warn!("stem models: {e}");
                 stems.set_status(Status::Failed);
                 return;

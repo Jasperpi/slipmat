@@ -251,8 +251,9 @@ impl App {
         }
         let audio = loader::load(&session, uri, track.duration_ms)?;
         // Split into stems in the background, as the song arrives.
-        let stems = self.settings().stems.then(|| {
-            let st = Arc::new(Stems::for_track(&audio));
+        let settings = self.settings();
+        let stems = settings.stems.then(|| {
+            let st = Arc::new(Stems::for_track(&audio, stems::Model::choose(settings.stem_quality)));
             stems::spawn(audio.clone(), st.clone());
             st
         });

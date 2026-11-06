@@ -170,6 +170,8 @@ pub struct DeckState {
     /// Frames separated into stems so far, and how that is going.
     pub stems_ready: f64,
     pub stems_status: Option<stems::Status>,
+    /// Separated with Demucs (the high-quality model).
+    pub stems_hq: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -722,6 +724,7 @@ impl Engine {
                 stems: deck.stem_gain,
                 stems_ready: deck.stems.as_ref().map_or(0.0, |s| s.ready() as f64),
                 stems_status: deck.stems.as_ref().map(|s| s.status()),
+                stems_hq: deck.stems.as_ref().is_some_and(|s| s.model == stems::Model::Demucs),
                 meter: [s.meter[0].level, s.meter[1].level],
             };
         }

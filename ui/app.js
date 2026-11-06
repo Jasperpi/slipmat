@@ -733,7 +733,7 @@ function onState(msg) {
     ui.stemBtns.forEach((b, k) => { cls(b, 'muted', st.stems[k] < 0.5); b.disabled = !st.stems_status; });
     const ss = st.stems_status;
     const pctDone = st.len ? Math.min(100, Math.floor(st.stems_ready / st.len * 100)) : 0;
-    setText(ui.stemNote, !st.loaded ? '' : !ss ? 'stems off' : ss === 'done' ? '' : ss === 'downloading' ? 'getting stem models…' : ss === 'failed' ? 'stems failed' : ss === 'separating' ? `splitting ${pctDone}%` : ss === 'waiting' ? 'stems queued' : '');
+    setText(ui.stemNote, !st.loaded ? '' : !ss ? 'stems off' : ss === 'done' ? (st.stems_hq ? 'HQ' : '') : ss === 'downloading' ? 'getting stem models…' : ss === 'failed' ? 'stems failed' : ss === 'separating' ? `splitting${st.stems_hq ? ' (HQ)' : ''} ${pctDone}%` : ss === 'waiting' ? 'stems queued' : '');
     cls(ui.stemNote, 'bad', ss === 'failed');
     const lp = st.loop;
     const period = st.grid ? SRC * 60 / st.grid.bpm : 0;
@@ -912,6 +912,7 @@ async function openSettings() {
   $('#set-range').value = String(s.range);
   $('#set-camelot').checked = s.camelot;
   $('#set-stems').checked = s.stems;
+  $('#set-stem-quality').value = s.stem_quality;
   const login = S.extras.login;
   setText($('#set-account'), login?.state === 'online' ? `Signed in as ${login.user}` : 'Not signed in');
   outputStatus(S.extras.output);
@@ -944,6 +945,7 @@ async function saveSettings() {
   s.range = +$('#set-range').value;
   s.camelot = $('#set-camelot').checked;
   s.stems = $('#set-stems').checked;
+  s.stem_quality = $('#set-stem-quality').value;
   useCamelot(s.camelot);
   try {
     const r = await api.post('/api/settings', s);

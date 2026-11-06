@@ -23,6 +23,8 @@ pub struct Settings {
     pub camelot: bool,
     /// Split every song into vocals, melody, bass and drums when it loads.
     pub stems: bool,
+    /// Which separation: auto (Demucs on computers with 12 GB+), fast, best.
+    pub stem_quality: crate::stems::Quality,
 }
 
 impl Default for Settings {
@@ -37,6 +39,7 @@ impl Default for Settings {
             vinyl: true,
             camelot: true,
             stems: true,
+            stem_quality: crate::stems::Quality::Auto,
         }
     }
 }

@@ -49,7 +49,11 @@ pub async fn run(args: &[String]) -> Result<()> {
         return load(q).await;
     }
     if let Some(f) = value(args, "--stems") {
-        return stems_file(f);
+        let model = match value(args, "--model") {
+            Some("demucs") => crate::stems::Model::Demucs,
+            _ => crate::stems::Model::Spleeter,
+        };
+        return stems_file(f, model).await;
     }
     if args.iter().any(|a| a == "--fake-ddj") {
         return fake_ddj();
@@ -237,8 +241,12 @@ fn fake_ddj() -> Result<()> {
 
 /// Separate a raw f32 stereo file and, if `ref_<stem>.f32` files from the
 /// Python reference sit beside it, report how far apart the two are.
-fn stems_file(path: &str) -> Result<()> {
+async fn stems_file(path: &str, model: crate::stems::Model) -> Result<()> {
     use crate::stems::{Stems, separate};
+    if !crate::stems::models_present(model) {
+        println!("  downloading the {model:?} model…");
+        crate::stems::download_models(model).await?;
+    }
     use crate::track::TrackAudio;
     let bytes = std::fs::read(path)?;
     let samples: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
@@ -246,11 +254,12 @@ fn stems_file(path: &str) -> Result<()> {
     let track = TrackAudio::new((frames as f64 / SRC_RATE * 1000.0) as u32);
     track.push(&samples);
     track.done.store(true, std::sync::atomic::Ordering::Release);
-    let stems = Stems::for_track(&track);
+    let stems = Stems::for_track(&track, model);
     let t = Instant::now();
     separate(&track, &stems)?;
-    println!("{G} separated {:.1} s of audio in {:.2} s", frames as f64 / SRC_RATE, t.elapsed().as_secs_f64());
+    println!("{G} {model:?}: separated {:.1} s of audio in {:.2} s", frames as f64 / SRC_RATE, t.elapsed().as_secs_f64());
     let dir = std::path::Path::new(path).parent().unwrap_or(std::path::Path::new("."));
+    let dir = if model == crate::stems::Model::Demucs { dir.join("demucs") } else { dir.to_path_buf() };
     for (k, name) in ["vocals", "drums", "bass"].iter().enumerate() {
         let Ok(r) = std::fs::read(dir.join(format!("ref_{name}.f32"))) else { continue };
         let reference: Vec<f32> = r.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();

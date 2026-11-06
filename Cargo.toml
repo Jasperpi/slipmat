@@ -29,6 +29,8 @@ rustfft = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# How much memory this computer has (to pick the stem model).
+sysinfo = { version = "0.36", default-features = false, features = ["system"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "signal", "net", "io-util"] }
 
 [profile.dev]
@@ -42,6 +44,10 @@ opt-level = 3
 opt-level = 3
 debug = false
 strip = true
+
+# On Windows, stems can run on the graphics card through DirectML.
+[target.'cfg(windows)'.dependencies]
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "download-binaries", "tls-native", "directml"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Only to quiet ALSA's console chatter about devices this machine lacks.
