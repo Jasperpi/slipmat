@@ -805,6 +805,7 @@ function onState(msg) {
     f.targets.forEach(([bit, b]) => cls(b, 'on', fx.assign & bit));
   });
   pills();
+  renderAutoDj();
   library.render();
 }
 
@@ -929,6 +930,69 @@ function frame(t) {
   });
 }
 
+// ---- auto-dj ----------------------------------------------------------------------------
+
+const adj = { sig: '' };
+function autoDj(body) {
+  return api.post('/api/autodj', body).catch((e) => toast(e.message, true));
+}
+function addToAutoDj(rows, next = false) {
+  const items = rows.filter((r) => r?.playable).map((r) => ({ uri: r.uri, id: r.id, name: r.name, artist: r.artist, image: r.image, duration_ms: r.duration_ms }));
+  if (!items.length) return;
+  autoDj({ action: 'add', items, next });
+  toast(items.length === 1 ? `Auto-DJ: added “${items[0].name}”` : `Auto-DJ: added ${items.length} songs`);
+}
+$('#adj-on').onclick = () => autoDj({ action: 'on', on: !S.extras.autodj?.on });
+$('#adj-skip').onclick = () => autoDj({ action: 'skip' });
+$('#adj-clear').onclick = () => autoDj({ action: 'clear' });
+$('#adj-bars').onchange = (e) => autoDj({ action: 'bars', bars: +e.target.value });
+$('#adj-list').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-remove]');
+  if (b) autoDj({ action: 'remove', index: +b.dataset.remove });
+  const top = e.target.closest('button[data-top]');
+  if (top) autoDj({ action: 'move', from: +top.dataset.top, to: 0 });
+});
+{
+  const box = $('#autodj');
+  box.addEventListener('dragover', (e) => {
+    if (!e.dataTransfer.types.includes('text/x-slipmat-uri')) return;
+    e.preventDefault();
+    box.classList.add('drop');
+  });
+  box.addEventListener('dragleave', () => box.classList.remove('drop'));
+  box.addEventListener('drop', (e) => {
+    e.preventDefault();
+    box.classList.remove('drop');
+    const row = library.rowByUri(e.dataTransfer.getData('text/x-slipmat-uri'));
+    if (row) addToAutoDj([row]);
+  });
+}
+
+function renderAutoDj() {
+  const a = S.extras.autodj;
+  if (!a) return;
+  const on = $('#adj-on');
+  setText(on, a.on ? 'ON' : 'OFF');
+  cls(on, 'on', a.on);
+  const mins = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  let status = a.on ? a.note : a.queue.length ? 'Turn it on to start mixing.' : 'Add songs, then turn it on.';
+  if (a.on && a.mix_in != null) status = `Next mix in ${mins(a.mix_in)} · ${a.note}`;
+  setText($('#adj-status'), status);
+  $('#adj-progress').style.width = `${(a.progress ?? 0) * 100}%`;
+  if (document.activeElement !== $('#adj-bars')) $('#adj-bars').value = String(a.bars);
+  const sig = a.queue.map((q) => q.uri).join();
+  if (sig === adj.sig) return;
+  adj.sig = sig;
+  $('#adj-list').innerHTML = a.queue.length
+    ? a.queue.map((q, i) => `<div class="adj-item">
+        <span class="n">${i + 1}</span>
+        <span class="art"${q.image ? ` style="background-image:url('${q.image}')"` : ''}></span>
+        <span class="t"><b title="${esc(q.name)}">${esc(q.name)}</b><span>${esc(q.artist)}</span></span>
+        <span>${i ? `<button data-top="${i}" title="Play next">↑</button>` : ''}<button data-remove="${i}" title="Remove">×</button></span>
+      </div>`).join('')
+    : '<div class="adj-empty">Drag songs here, press <b>+</b> on a song,<br>or “Auto-DJ list” for a whole playlist.<br><br>Slipmat mixes each into the next:<br>in time, on the phrase, bass swapped.</div>';
+}
+
 // ---- settings, login, help ----------------------------------------------------------
 
 async function openSettings() {
@@ -1051,6 +1115,7 @@ const mixer = buildMixer();
 const library = new Library({
   api,
   onLoad: load,
+  onAdd: (rows) => addToAutoDj(rows),
   getContext: () => {
     const lead = leadDeck();
     return { decks: S.decks.map((m) => m && { id: m.id }), lead, sig: `${S.decks.map((m) => m?.id).join()}|${lead?.key}|${lead?.bpm?.toFixed(1)}` };

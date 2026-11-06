@@ -83,6 +83,7 @@ pub struct BatchStatus {
 
 pub struct App {
     pub spotify: Arc<Spotify>,
+    pub autodj: crate::autodj::AutoDj,
     pub engine: Handle,
     pub output: Output,
     pub store: Store,
@@ -124,6 +125,7 @@ impl App {
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
         let app = Arc::new(Self {
             spotify: Spotify::new(),
+            autodj: crate::autodj::AutoDj::default(),
             engine: handle,
             output,
             store: Store::open(),
@@ -138,6 +140,7 @@ impl App {
         app.spotify.resume();
         tokio::spawn(app.clone().keep_cues());
         tokio::spawn(app.clone().batch_worker(batch_rx));
+        tokio::spawn(crate::autodj::run(app.clone()));
         app
     }
 
@@ -284,7 +287,10 @@ impl App {
             return;
         }
         let a = audio.clone();
-        let Ok(Some(result)) = tokio::task::spawn_blocking(move || analysis::analyse(&a.mono())).await else {
+        let Ok(Some(result)) = tokio::task::spawn_blocking(move || {
+            crate::priority::background();
+            analysis::analyse(&a.mono())
+        }).await else {
             if let Some(Some(on)) = self.decks.lock().unwrap().get_mut(d) {
                 on.analysing = false;
             }
@@ -340,7 +346,10 @@ impl App {
                 }
                 if audio.done.load(std::sync::atomic::Ordering::Acquire) {
                     let a = audio.clone();
-                    if let Ok(Some(result)) = tokio::task::spawn_blocking(move || analysis::analyse(&a.mono())).await {
+                    if let Ok(Some(result)) = tokio::task::spawn_blocking(move || {
+            crate::priority::background();
+            analysis::analyse(&a.mono())
+        }).await {
                         self.store.update(&id, |t| t.analysis = Some(result.clone()));
                         let _ = self.events.send(Event::Analysed { id: id.clone(), bpm: result.bpm, key: result.key });
                     }

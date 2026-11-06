@@ -200,6 +200,9 @@ pub struct State {
     /// Seconds of audio rendered since start: the clock positions belong to.
     pub clock: f64,
     pub rate: f64,
+    /// Share of the time available that mixing takes (worst block of the
+    /// last second): over 1.0 means the sound card is being starved.
+    pub load: f32,
 }
 
 pub struct Engine {
@@ -222,6 +225,9 @@ pub struct Engine {
     master_meter: [Meter; 2],
     clock: f64,
     since_publish: f64,
+    load_peak: f32,
+    load_age: f64,
+    load_shown: f32,
     rx: Receiver<Cmd>,
     trash: Sender<Garbage>,
     state: Arc<Mutex<State>>,
@@ -273,6 +279,9 @@ impl Engine {
             master_meter: [Meter::default(); 2],
             clock: 0.0,
             since_publish: 1.0,
+            load_peak: 0.0,
+            load_age: 0.0,
+            load_shown: 0.0,
             rx,
             trash,
             state: state.clone(),
@@ -576,6 +585,7 @@ impl Engine {
     }
 
     fn block(&mut self, master: &mut [f32], cue: &mut [f32]) {
+        let began = std::time::Instant::now();
         while let Ok(cmd) = self.rx.try_recv() {
             self.command(cmd);
         }
@@ -674,6 +684,14 @@ impl Engine {
             *c = ((*c * cg + *m * mgain) * hl).clamp(-1.0, 1.0);
         }
         self.bufs = bufs;
+        let load = (began.elapsed().as_secs_f64() / secs) as f32;
+        self.load_peak = self.load_peak.max(load);
+        self.load_age += secs;
+        if self.load_age >= 1.0 {
+            self.load_shown = self.load_peak;
+            self.load_peak = 0.0;
+            self.load_age = 0.0;
+        }
         self.clock += secs;
         self.since_publish += secs;
         if self.since_publish >= 0.01 {
@@ -744,6 +762,7 @@ impl Engine {
         st.quantize = self.quantize;
         st.auto_gain = self.auto_gain;
         st.clock = self.clock;
+        st.load = self.load_shown;
         st.rate = self.rate;
     }
 }

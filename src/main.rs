@@ -3,11 +3,13 @@
 
 mod analysis;
 mod app;
+mod autodj;
 mod doctor;
 mod engine;
 mod loader;
 mod midi;
 mod paths;
+mod priority;
 mod server;
 mod session;
 mod settings;

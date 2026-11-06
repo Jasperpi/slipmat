@@ -58,7 +58,9 @@
     <div class="tracks-head">
       <h2 id="list-title">Liked Songs</h2>
       <input id="filter" type="search" placeholder="Filter this list" autocomplete="off" spellcheck="false">
+      <button class="small" id="match" title="Only songs that mix well with the playing deck: compatible key, BPM within 6%">Match</button>
       <button class="small" id="analyze-list" title="Work out BPM and key for every song in this list">Analyze list</button>
+      <button class="small" id="queue-list" title="Add every song in this list to Auto-DJ">Auto-DJ list</button>
       <span class="count" id="list-count"></span>
     </div>
     <div class="table" id="table">
@@ -75,6 +77,20 @@
       <div class="rows" id="rows"></div>
     </div>
   </div>
+  <aside class="autodj" id="autodj">
+    <div class="adj-head">
+      <span class="adj-title">AUTO-DJ</span>
+      <button class="adj-toggle" id="adj-on" title="Let Slipmat mix the list by itself">OFF</button>
+    </div>
+    <div class="adj-status" id="adj-status">Add songs, then turn it on.</div>
+    <div class="adj-bar"><i id="adj-progress"></i></div>
+    <div class="adj-controls">
+      <button class="small" id="adj-skip" title="Start mixing into the next song at the next bar">Mix now</button>
+      <select id="adj-bars" title="How long each mix lasts"><option value="8">8 bars</option><option value="16">16 bars</option><option value="32">32 bars</option></select>
+      <button class="small" id="adj-clear">Clear</button>
+    </div>
+    <div class="adj-list" id="adj-list"></div>
+  </aside>
 </section>
 
 <div class="overlay" id="login" hidden>

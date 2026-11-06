@@ -380,6 +380,7 @@ pub fn release_idle() {
 /// Separate `track` into `stems`, waiting for it to decode as needed.
 /// Blocking: run it on a thread of its own.
 pub fn separate(track: &TrackAudio, stems: &Stems) -> Result<()> {
+    crate::priority::background();
     let started = Instant::now();
     stems.set_status(Status::Separating);
     let finished = match stems.model {

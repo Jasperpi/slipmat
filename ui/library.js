@@ -6,9 +6,11 @@ import { keyChip, keyCode, compatible } from './keys.js';
 const ROW = 38;
 
 export class Library {
-  constructor({ api, onLoad, getContext }) {
+  constructor({ api, onLoad, onAdd, getContext }) {
     this.api = api;
     this.onLoad = onLoad;
+    this.onAdd = onAdd;
+    this.match = false;
     this.getContext = getContext; // { decks: [{id, key, bpm}], lead: {key, bpm} }
     this.rows = [];
     this.view = [];
@@ -47,6 +49,18 @@ export class Library {
       const b = e.target.closest('.source');
       if (!b) return;
       this.open(b.dataset.src, b.dataset.id);
+    });
+    const matchBtn = document.getElementById('match');
+    matchBtn.addEventListener('click', () => {
+      this.match = !this.match;
+      matchBtn.classList.toggle('on', this.match);
+      if (this.match && !this.getContext().lead) window.toast('Load a song on a deck first: Match shows what mixes with it.');
+      this.apply();
+    });
+    document.getElementById('queue-list').addEventListener('click', () => {
+      const rows = this.view.filter((r) => r.playable);
+      if (!rows.length) return;
+      this.onAdd(rows);
     });
     document.getElementById('analyze-list').addEventListener('click', () => {
       const uris = this.view.filter((r) => r.playable && r.bpm == null).map((r) => r.uri);
@@ -112,6 +126,20 @@ export class Library {
   apply() {
     const q = this.filter.value.trim().toLowerCase();
     let v = q ? this.rows.filter((r) => `${r.name} ${r.artist} ${r.album}`.toLowerCase().includes(q)) : this.rows.slice();
+    if (this.match) {
+      // Songs that mix well with the playing deck: key next to it on the
+      // wheel, and a tempo within 6% (or half/double time).
+      const ctx = this.getContext();
+      this.matchSig = ctx.sig;
+      const lead = ctx.lead;
+      if (lead?.bpm) {
+        const onDeck = new Set(ctx.decks.filter(Boolean).map((d) => d.id));
+        const off = (bpm) => Math.min(...[0.5, 1, 2].map((m) => Math.abs((bpm * m) / lead.bpm - 1)));
+        v = v
+          .filter((r) => r.bpm && !onDeck.has(r.id) && off(r.bpm) < 0.06 && (lead.key == null || r.key == null || compatible(lead.key, r.key)))
+          .sort((a, b) => off(a.bpm) - off(b.bpm));
+      }
+    }
     if (this.sort) {
       const { key, dir } = this.sort;
       const val = (r) => key === 'key' ? (r.key == null ? 999 : keyCode(r.key).num * 2 + (keyCode(r.key).minor ? 0 : 1)) : (r[key] ?? (typeof this.rows[0]?.[key] === 'string' ? '' : 1e9));
@@ -134,6 +162,10 @@ export class Library {
   }
 
   render(force) {
+    if (this.match && this.getContext().sig !== this.matchSig) {
+      this.apply();
+      return;
+    }
     const top = this.el.scrollTop;
     const h = this.el.clientHeight;
     const first = Math.max(0, Math.floor(top / ROW) - 6);
@@ -162,7 +194,7 @@ export class Library {
         <span class="c-key">${keyHtml}</span>
         <span class="c-time">${mmss(r.duration_ms / 1000)}</span>
         <span class="c-album">${esc(r.album)}</span>
-        <span class="c-load">${r.playable ? '<button data-d="0" title="Load on deck 1">1</button><button data-d="1" title="Load on deck 2">2</button>' : ''}</span>
+        <span class="c-load">${r.playable ? '<button data-add="1" title="Add to Auto-DJ">+</button><button data-d="0" title="Load on deck 1">1</button><button data-d="1" title="Load on deck 2">2</button>' : ''}</span>
       </div>`);
     }
     this.spacer.innerHTML = html.join('');
@@ -174,7 +206,8 @@ export class Library {
       if (!row) return;
       this.sel = +row.dataset.i;
       const btn = e.target.closest('.c-load button');
-      if (btn) this.onLoad(+btn.dataset.d, this.view[this.sel]);
+      if (btn?.dataset.add) this.onAdd([this.view[this.sel]]);
+      else if (btn) this.onLoad(+btn.dataset.d, this.view[this.sel]);
       this.render(true);
     });
     this.spacer.addEventListener('dblclick', (e) => {
@@ -225,6 +258,10 @@ export class Library {
 
   selected() {
     return this.view[this.sel];
+  }
+
+  rowByUri(uri) {
+    return this.rows.find((r) => r.uri === uri);
   }
 }
 

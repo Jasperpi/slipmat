@@ -80,6 +80,7 @@ pub async fn run(open: bool) -> Result<()> {
         .route("/api/devices", get(devices))
         .route("/api/control", post(control))
         .route("/api/quit", post(quit))
+        .route("/api/autodj", get(autodj_status).post(autodj))
         .layer(middleware::from_fn(local_only))
         .with_state(app.clone());
     println!("Slipmat is running: {url}  (Ctrl-C to quit)");
@@ -251,6 +252,15 @@ async fn devices() -> Json<Value> {
     Json(json!({ "devices": list }))
 }
 
+async fn autodj_status(State(app): State<Shared>) -> Json<crate::autodj::Status> {
+    Json(app.autodj.status())
+}
+
+async fn autodj(State(app): State<Shared>, Json(r): Json<crate::autodj::Request>) -> Json<crate::autodj::Status> {
+    app.autodj.handle(r);
+    Json(app.autodj.status())
+}
+
 async fn quit() -> Json<Value> {
     tokio::spawn(async {
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -302,6 +312,7 @@ async fn session(app: Shared, mut socket: WebSocket) {
                 // The slower-changing parts every ~half second.
                 if slow % 15 == 0 {
                     extras = json!({
+                        "autodj": app.autodj.status(),
                         "login": app.spotify.login(),
                         "output": app.output.status(),
                         "midi": app.midi.lock().unwrap().clone(),
@@ -309,6 +320,7 @@ async fn session(app: Shared, mut socket: WebSocket) {
                     });
                 }
                 slow += 1;
+                extras["autodj"] = serde_json::to_value(app.autodj.status()).unwrap_or_default();
                 let msg = json!({
                     "t": "state",
                     "engine": app.engine.snapshot(),

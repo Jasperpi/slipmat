@@ -183,6 +183,7 @@ fn spawn_silent(engine: Arc<Mutex<Engine>>, silent: Arc<std::sync::atomic::Atomi
         let n = 512;
         let mut m = vec![0.0f32; n * 2];
         let mut c = vec![0.0f32; n * 2];
+        let _realtime = audio_thread_priority::promote_current_thread_to_real_time(n as u32, 44_100).ok();
         let mut next = Instant::now();
         while silent.load(std::sync::atomic::Ordering::Relaxed) == generation {
             let rate = {
@@ -320,10 +321,22 @@ fn stream<T: SizedSample + FromSample<f32>>(
     let channels = config.channels as usize;
     let mut master = vec![0.0f32; MAX_BLOCK * 2];
     let mut cue = vec![0.0f32; MAX_BLOCK * 2];
+    let rate = config.sample_rate.0;
+    let mut realtime: Option<Option<audio_thread_priority::RtPriorityHandle>> = None;
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _| {
             let frames = data.len() / channels;
+            // First time through: ask for real-time priority (kept while the
+            // stream lives). Without it a busy computer can starve the music.
+            if realtime.is_none() {
+                let handle = audio_thread_priority::promote_current_thread_to_real_time(frames as u32, rate);
+                match &handle {
+                    Ok(_) => log::info!("audio thread: real-time priority"),
+                    Err(e) => log::warn!("audio thread: no real-time priority ({e})"),
+                }
+                realtime = Some(handle.ok());
+            }
             let mut done = 0;
             while done < frames {
                 let n = (frames - done).min(MAX_BLOCK);
