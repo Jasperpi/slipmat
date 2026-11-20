@@ -10,6 +10,10 @@ use crate::stems::Stems;
 use crate::track::{SRC_RATE, TrackAudio};
 
 pub const HOTCUES: usize = 8;
+/// Memory cues a song can keep (the CUE/LOOP CALL buttons step through them).
+pub const MEMS: usize = 8;
+/// Furthest the key can be shifted, in semitones each way.
+pub const KEY_RANGE: i8 = 12;
 /// Song frames one jog-wheel tick moves when scratching: a 720-tick platter
 /// turning at 33⅓ rpm plays at normal speed.
 pub const FRAMES_PER_TICK: f64 = SRC_RATE * (60.0 / (100.0 / 3.0)) / 720.0;
@@ -52,6 +56,13 @@ impl Loop {
     pub fn len(&self) -> f64 {
         self.end - self.start
     }
+}
+
+/// A saved point in the song, with the loop that was running there if any.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Mem {
+    pub pos: f64,
+    pub end: Option<f64>,
 }
 
 struct Scratch {
@@ -120,6 +131,13 @@ pub struct Deck {
     hot_preview: Option<usize>,
     play_latch: bool,
     pub hotcues: [Option<f64>; HOTCUES],
+    pub memory: [Option<Mem>; MEMS],
+    /// The memory cue last called, for deleting it.
+    mem_last: Option<usize>,
+    /// Semitones the key is shifted by (tempo unchanged).
+    pub key_shift: i8,
+    /// A loop roll is held: leaving it carries on where the song would be.
+    pub rolling: bool,
     pub lp: Option<Loop>,
     pub loop_in: Option<f64>,
     pub slip: bool,
@@ -162,6 +180,10 @@ impl Default for Deck {
             hot_preview: None,
             play_latch: false,
             hotcues: [None; HOTCUES],
+            memory: [None; MEMS],
+            mem_last: None,
+            key_shift: 0,
+            rolling: false,
             lp: None,
             loop_in: None,
             slip: false,
@@ -280,6 +302,19 @@ impl Deck {
         self.play_latch = false;
     }
 
+    /// Stop and go back to the cue point (fader start, pulled back down).
+    pub fn back_cue(&mut self) {
+        if self.track.is_none() {
+            return;
+        }
+        self.pause();
+        self.stop_at(self.cue);
+    }
+
+    pub fn set_key_shift(&mut self, semitones: i8) {
+        self.key_shift = semitones.clamp(-KEY_RANGE, KEY_RANGE);
+    }
+
     pub fn play_pause(&mut self) {
         if self.cue_preview || self.hot_preview.is_some() {
             self.play_latch = true;
@@ -370,20 +405,99 @@ impl Deck {
                 return;
             }
         }
+        let start = self.loop_start(g, beats, quantize);
+        self.set_loop(start, start + beats * g.period());
+    }
+
+    fn loop_start(&self, g: Grid, beats: f64, quantize: bool) -> f64 {
         let start = if quantize {
             // The beat just passed (or one about to land).
             g.at((g.beat(self.pos) + 0.03).floor())
         } else {
             self.pos
         };
-        let start = if beats < 1.0 && quantize {
+        if beats < 1.0 && quantize {
             // Short loops start on the current subdivision.
             let sub = g.period() * beats;
             start + ((self.pos - start) / sub).floor() * sub
         } else {
             start
+        }
+    }
+
+    /// Loop roll: loops while held; on release the song carries on from
+    /// where it would have been had it never looped.
+    pub fn loop_roll(&mut self, beats: f64, down: bool, quantize: bool) {
+        if down {
+            let Some(g) = self.grid else { return };
+            if self.slip_pos.is_none() {
+                self.slip_pos = Some(self.pos);
+            }
+            self.rolling = true;
+            let start = self.loop_start(g, beats, quantize);
+            self.set_loop(start, start + beats * g.period());
+        } else if self.rolling {
+            self.rolling = false;
+            self.loop_exit();
+        }
+    }
+
+    // ---- memory cues -----------------------------------------------------------
+
+    /// Save where the deck is (its loop, if one is running) as a memory cue.
+    pub fn mem_store(&mut self, quantize: bool) -> bool {
+        if self.track.is_none() {
+            return false;
+        }
+        let mem = match self.lp.filter(|l| l.active) {
+            Some(l) => Mem { pos: l.start, end: Some(l.end) },
+            None => Mem { pos: if self.playing { self.snap(self.pos, quantize) } else { self.pos }, end: None },
         };
-        self.set_loop(start, start + beats * g.period());
+        // One already there is replaced; else the first free slot.
+        let near = self.memory.iter().position(|m| m.is_some_and(|m| (m.pos - mem.pos).abs() < 200.0));
+        let Some(i) = near.or_else(|| self.memory.iter().position(|m| m.is_none())) else { return false };
+        self.memory[i] = Some(mem);
+        self.mem_last = Some(i);
+        true
+    }
+
+    /// Go to the next (`dir` > 0) or previous memory cue. A paused deck
+    /// waits there with its cue point moved to it; a playing deck jumps and
+    /// keeps playing.
+    pub fn mem_call(&mut self, dir: i8) -> bool {
+        let here = self.pos;
+        let pick = self
+            .memory
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| m.map(|m| (i, m)))
+            .filter(|(_, m)| if dir > 0 { m.pos > here + 64.0 } else { m.pos < here - 64.0 })
+            .min_by(|a, b| (a.1.pos - here).abs().total_cmp(&(b.1.pos - here).abs()));
+        let Some((i, m)) = pick else { return false };
+        self.mem_last = Some(i);
+        if !self.playing {
+            self.cue = m.pos;
+        }
+        self.jump(m.pos);
+        self.lp = match m.end {
+            Some(end) => Some(Loop { start: m.pos, end, active: true }),
+            None => self.lp.map(|l| Loop { active: false, ..l }),
+        };
+        true
+    }
+
+    /// Delete the memory cue last called or saved, or the one right here.
+    pub fn mem_delete(&mut self) -> bool {
+        let here = self.pos;
+        let last = self.mem_last.take().filter(|&i| self.memory[i].is_some());
+        let near = || self.memory.iter().position(|m| m.is_some_and(|m| (m.pos - here).abs() < SRC_RATE * 0.5));
+        match last.or_else(near) {
+            Some(i) => {
+                self.memory[i] = None;
+                true
+            }
+            None => false,
+        }
     }
 
     fn set_loop(&mut self, start: f64, end: f64) {
@@ -621,6 +735,8 @@ impl Deck {
         best.1 as f64
     }
 
+    /// `ratio` is how fast the grains themselves are read (their pitch);
+    /// the deck's position moves on at its own speed regardless.
     fn stretched(&mut self, track: &TrackAudio, len: usize, ratio: f64) -> (f32, f32) {
         let h = GRAIN;
         if !self.stretch.active {
@@ -677,6 +793,7 @@ impl Deck {
         let stem_step = (1.0 / (0.005 * rate)) as f32;
         let sub = 64;
         let dt = sub as f64 / rate;
+        let key = 2f64.powf(self.key_shift as f64 / 12.0);
         // Start the motor at once; stop it only after fading out.
         if self.playing {
             self.motor = true;
@@ -726,7 +843,14 @@ impl Deck {
                 continue;
             }
             let step = self.speed * ratio;
-            let stretch = self.keylock && self.scratch.is_none() && !self.reverse && (self.speed - 1.0).abs() > 0.002 && self.speed > 0.25;
+            // The pitch the song should sound at: its own with key lock,
+            // else following the speed; either way moved by the key shift.
+            let pitch = if self.keylock { key } else { self.speed * key };
+            let stretch = (self.keylock || self.key_shift != 0)
+                && self.scratch.is_none()
+                && !self.reverse
+                && self.speed > 0.25
+                && (pitch - self.speed).abs() > 0.002;
             if stretch != self.stretching {
                 self.stretching = stretch;
                 self.stretch.active = false;
@@ -734,7 +858,7 @@ impl Deck {
                     self.tail = Some(Tail { pos: self.pos, left: TAIL, speed: step, gain: 1.0 });
                 }
             }
-            let (mut l, mut r) = if stretch { self.stretched(&track, len, ratio) } else { self.read(&track, len, self.pos) };
+            let (mut l, mut r) = if stretch { self.stretched(&track, len, ratio * pitch) } else { self.read(&track, len, self.pos) };
             if let Some(t) = self.tail.as_mut() {
                 let mix = t.left as f32 / TAIL as f32;
                 let pos = t.pos;
@@ -938,5 +1062,89 @@ mod tests {
         let mono: Vec<f32> = out.chunks(2).map(|c| c[0]).skip(44_100).take(44_100).collect();
         let crossings = mono.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
         assert!((crossings as i32 - 440).abs() <= 6, "{crossings} Hz with key lock");
+    }
+
+    #[test]
+    fn key_shift_moves_the_pitch_and_not_the_tempo() {
+        let hz = |shift: i8, keylock: bool, pitch: f32| -> (f64, f64) {
+            let mut d = Deck::default();
+            d.load(tone_track(20.0), None, None, 0.0, [None; 8]);
+            d.keylock = keylock;
+            d.pitch = pitch;
+            d.tempo = d.own_tempo();
+            d.set_key_shift(shift);
+            d.play();
+            let out = run(&mut d, 4.0, 44_100.0);
+            let mono: Vec<f32> = out.chunks(2).map(|c| c[0]).skip(44_100).take(88_200).collect();
+            let crossings = mono.windows(2).filter(|w| w[0] < 0.0 && w[1] >= 0.0).count();
+            (crossings as f64 / 2.0, d.pos / SRC_RATE / 4.0)
+        };
+        // Up two semitones: 440 Hz becomes ~494 Hz, still at normal speed.
+        let (f, speed) = hz(2, true, 0.0);
+        assert!((f - 493.9).abs() < 6.0, "{f} Hz");
+        assert!((speed - 1.0).abs() < 0.01, "speed {speed}");
+        // Down three, with the tempo up 6% and key lock: ~370 Hz at 1.06x.
+        let (f, speed) = hz(-3, true, 0.75);
+        assert!((f - 370.0).abs() < 6.0, "{f} Hz");
+        assert!((speed - 1.06).abs() < 0.01, "speed {speed}");
+        // No shift, no key lock: pitch follows the speed, as before.
+        let (f, _) = hz(0, false, 0.75);
+        assert!((f - 466.4).abs() < 4.0, "{f} Hz");
+    }
+
+    #[test]
+    fn loop_roll_carries_on_where_the_song_would_be() {
+        let mut d = Deck::default();
+        let grid = Grid { bpm: 120.0, anchor: 0.0 };
+        d.load(tone_track(30.0), None, Some(grid), 0.0, [None; 8]);
+        d.jump(grid.period() * 8.0);
+        d.play();
+        run(&mut d, 0.1, 44_100.0);
+        d.loop_roll(1.0, true, true);
+        assert!(d.rolling && d.lp.is_some_and(|l| l.active));
+        run(&mut d, 3.0, 44_100.0);
+        assert!(d.pos < grid.period() * 9.0 + 10.0, "held in the one-beat loop");
+        d.loop_roll(1.0, false, true);
+        // 3.1 s after beat 8 at 120 BPM is about beat 14.2.
+        let beat = grid.beat(d.pos);
+        assert!((beat - 14.2).abs() < 0.1, "came out at beat {beat}");
+        assert!(!d.rolling && !d.lp.unwrap().active);
+    }
+
+    #[test]
+    fn memory_cues_store_call_and_delete() {
+        let mut d = Deck::default();
+        let grid = Grid { bpm: 120.0, anchor: 0.0 };
+        d.load(tone_track(60.0), None, Some(grid), 0.0, [None; 8]);
+        let beat = |n: f64| grid.period() * n;
+        d.jump(beat(16.0));
+        assert!(d.mem_store(true));
+        d.jump(beat(64.0));
+        d.auto_loop(4.0, true);
+        assert!(d.mem_store(true), "a loop is saved with its length");
+        d.reloop();
+        d.jump(0.0);
+        assert!(d.mem_call(1));
+        assert!((d.pos - beat(16.0)).abs() < 1.0 && (d.cue - beat(16.0)).abs() < 1.0, "paused deck waits there, cue moved");
+        assert!(d.mem_call(1));
+        assert!((d.pos - beat(64.0)).abs() < 1.0);
+        let l = d.lp.unwrap();
+        assert!(l.active && (l.len() - beat(4.0)).abs() < 1.0, "the loop came back");
+        assert!(!d.mem_call(1), "nothing further on");
+        assert!(d.mem_call(-1));
+        assert!((d.pos - beat(16.0)).abs() < 1.0 && !d.lp.unwrap().active);
+        assert!(d.mem_delete());
+        assert_eq!(d.memory.iter().flatten().count(), 1);
+    }
+
+    #[test]
+    fn back_cue_stops_at_the_cue_point() {
+        let mut d = Deck::default();
+        d.load(tone_track(20.0), None, None, 4_000.0, [None; 8]);
+        d.play();
+        run(&mut d, 0.5, 44_100.0);
+        d.back_cue();
+        run(&mut d, 0.05, 44_100.0);
+        assert!(!d.playing && d.at_cue());
     }
 }

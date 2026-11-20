@@ -17,10 +17,27 @@ pub enum FxKind {
     Trans,
     Crush,
     Wobble,
+    /// Echo whose repeats lose their bass, so they never muddy the mix.
+    LowCutEcho,
+    /// Echo bouncing between left and right.
+    PingPong,
+    /// A long, darkening echo that spirals away.
+    Spiral,
 }
 
-pub const ALL: [FxKind; 8] =
-    [FxKind::Echo, FxKind::Reverb, FxKind::Flanger, FxKind::Phaser, FxKind::Roll, FxKind::Trans, FxKind::Crush, FxKind::Wobble];
+pub const ALL: [FxKind; 11] = [
+    FxKind::Echo,
+    FxKind::LowCutEcho,
+    FxKind::PingPong,
+    FxKind::Spiral,
+    FxKind::Reverb,
+    FxKind::Flanger,
+    FxKind::Phaser,
+    FxKind::Roll,
+    FxKind::Trans,
+    FxKind::Crush,
+    FxKind::Wobble,
+];
 
 impl FxKind {
     pub fn name(self) -> &'static str {
@@ -33,7 +50,15 @@ impl FxKind {
             FxKind::Trans => "Trans",
             FxKind::Crush => "Crush",
             FxKind::Wobble => "Wobble",
+            FxKind::LowCutEcho => "Low Cut Echo",
+            FxKind::PingPong => "Ping Pong",
+            FxKind::Spiral => "Spiral",
         }
+    }
+
+    /// Keeps ringing after it is switched off (the others stop at once).
+    pub fn tails(self) -> bool {
+        matches!(self, FxKind::Echo | FxKind::LowCutEcho | FxKind::PingPong | FxKind::Spiral | FxKind::Reverb)
     }
 }
 
@@ -178,6 +203,8 @@ pub struct Unit {
     crush_hold: [f32; 2],
     crush_count: f32,
     wobble: [Biquad; 2],
+    /// Filter in the echo's feedback loop (low cut, or the spiral's darkening).
+    cut: Biquad,
     /// Dry/wet as heard, gliding to its target; also carries tails after "off".
     wet: f32,
     gate: f32,
@@ -205,6 +232,7 @@ impl Unit {
             crush_hold: [0.0; 2],
             crush_count: 0.0,
             wobble: [Biquad::default(); 2],
+            cut: Biquad::default(),
             wet: 0.0,
             gate: 1.0,
         }
@@ -224,6 +252,7 @@ impl Unit {
             b.reset();
         }
         self.phaser_fb = [0.0; 2];
+        self.cut.reset();
         self.roll_filled = false;
         self.roll_pos = 0;
         self.wet = 0.0;
@@ -247,21 +276,41 @@ impl Unit {
         let time = (beat_secs * beats).clamp(0.01, 5.5);
         let frames = buf.len() / 2;
         // Echo and reverb keep ringing after "off"; the others stop at once.
-        let tails = matches!(self.kind, FxKind::Echo | FxKind::Reverb);
+        let tails = self.kind.tails();
         let target = if self.on { 1.0 } else { 0.0 };
         let glide = 1.0 - (-1.0 / (0.01 * self.rate)).exp();
         let depth = self.depth.clamp(0.0, 1.0);
         let rate = self.rate;
         match self.kind {
-            FxKind::Echo => {
+            kind @ (FxKind::Echo | FxKind::LowCutEcho | FxKind::PingPong | FxKind::Spiral) => {
                 let back = time * rate;
-                let feedback = 0.35 + 0.5 * depth;
+                let feedback = if kind == FxKind::Spiral { 0.6 + 0.35 * depth } else { 0.35 + 0.5 * depth };
+                let filtered = match kind {
+                    FxKind::LowCutEcho => {
+                        self.cut.set(Kind::High, 450.0, 0.7, rate);
+                        true
+                    }
+                    FxKind::Spiral => {
+                        self.cut.set(Kind::Low, 3_200.0, 0.7, rate);
+                        true
+                    }
+                    _ => false,
+                };
                 for f in buf.chunks_exact_mut(2) {
                     self.wet += (target - self.wet) * glide;
-                    let (dl, dr) = (self.delay.read(0, back), self.delay.read(1, back));
+                    let (mut dl, mut dr) = (self.delay.read(0, back), self.delay.read(1, back));
+                    if filtered {
+                        dl = self.cut.run(0, dl);
+                        dr = self.cut.run(1, dr);
+                    }
                     // Only feed new sound in while on; the tail keeps repeating.
                     let send = self.wet;
-                    self.delay.write(f[0] * send + dl * feedback, f[1] * send + dr * feedback);
+                    if kind == FxKind::PingPong {
+                        // In on the left, then across and back.
+                        self.delay.write((f[0] + f[1]) * 0.5 * send + dr * feedback, dl * feedback);
+                    } else {
+                        self.delay.write(f[0] * send + dl * feedback, f[1] * send + dr * feedback);
+                    }
                     f[0] += dl * depth.max(0.3);
                     f[1] += dr * depth.max(0.3);
                 }
@@ -446,7 +495,7 @@ mod tests {
                 u.run(&mut silent, 0.47);
             }
             // Effects with tails eventually stop running.
-            assert!(!u.active() || matches!(kind, FxKind::Echo | FxKind::Reverb), "{kind:?}");
+            assert!(!u.active() || kind.tails(), "{kind:?}");
         }
     }
 

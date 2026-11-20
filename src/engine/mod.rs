@@ -5,13 +5,15 @@ pub mod deck;
 pub mod dsp;
 pub mod fx;
 pub mod output;
+pub mod sampler;
 
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
-use deck::{Deck, Grid, HOTCUES, Loop};
+use deck::{Deck, Grid, HOTCUES, Loop, MEMS, Mem};
+use sampler::{SLOTS, Sample, Sampler};
 use dsp::{Curve, Isolator, Limiter, Meter, SweepFilter};
 use fx::{FxKind, Unit};
 
@@ -79,10 +81,61 @@ pub enum Control {
     AutoGain { on: bool },
     /// Levels of vocals, melody, bass and drums on deck `d`, 0..1 each.
     Stems { d: usize, gains: [f32; 4] },
+    /// Stop and go back to the cue point (fader start, pulled back down).
+    BackCue { d: usize },
+    /// A loop held down that the song carries on past when let go.
+    LoopRoll { d: usize, beats: f64, down: bool },
+    /// Shift the key by semitones without changing the tempo.
+    KeyShift { d: usize, semitones: i8 },
+    MemStore { d: usize },
+    MemCall { d: usize, dir: i8 },
+    MemDelete { d: usize },
+    /// Smart Fader: moving between the decks also glides the tempo from one
+    /// song's to the other's and swaps their basslines.
+    SmartFader { on: bool },
+    /// Smart CFX: the filter knobs add an effect on top of the filter.
+    SmartCfx { on: bool },
+    CfxKind { kind: Cfx },
+    /// A sampler pad.
+    Sample { n: usize },
+    SampleStop { n: usize },
+    SamplerVolume { v: f32 },
+    /// Instant double: copy the other deck (song, place, tempo) onto `d`.
+    Double { d: usize },
+}
+
+/// What Smart CFX adds to the filter as its knob is turned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Cfx {
+    #[default]
+    Echo,
+    Space,
+    Noise,
+    Crush,
+    Jet,
+}
+
+pub const CFX_ALL: [Cfx; 5] = [Cfx::Echo, Cfx::Space, Cfx::Noise, Cfx::Crush, Cfx::Jet];
+
+impl Cfx {
+    pub fn name(self) -> &'static str {
+        match self {
+            Cfx::Echo => "Dub Echo",
+            Cfx::Space => "Space",
+            Cfx::Noise => "Noise",
+            Cfx::Crush => "Crush",
+            Cfx::Jet => "Jet",
+        }
+    }
 }
 
 /// A song taken off a deck, on its way to be freed off the audio thread.
-pub struct Garbage(#[allow(dead_code)] Option<Arc<TrackAudio>>, #[allow(dead_code)] Option<Arc<Stems>>);
+pub struct Garbage(
+    #[allow(dead_code)] Option<Arc<TrackAudio>>,
+    #[allow(dead_code)] Option<Arc<Stems>>,
+    #[allow(dead_code)] Option<Arc<Sample>>,
+);
 
 pub enum Cmd {
     Control(Control),
@@ -93,13 +146,15 @@ pub enum Cmd {
         grid: Option<Grid>,
         cue: f64,
         hotcues: [Option<f64>; HOTCUES],
+        memory: [Option<Mem>; MEMS],
         gain_db: f32,
     },
+    /// Put a sound on sampler pad `n` (or clear it).
+    Sample { n: usize, sample: Option<Arc<Sample>> },
     /// Analysis finished for the song now on deck `d` (ignored if it changed).
     Analysed { d: usize, track: Arc<TrackAudio>, grid: Grid, cue: Option<f64>, gain_db: f32 },
 }
 
-#[derive(Clone)]
 struct Strip {
     trim: f32,
     eq: [f32; 3],
@@ -111,6 +166,9 @@ struct Strip {
     auto_db: f32,
     isolator: Isolator,
     sweep: SweepFilter,
+    /// Smart CFX's effect on this channel, and its noise generator.
+    cfx: Unit,
+    noise: u32,
     meter: [Meter; 2],
 }
 
@@ -126,6 +184,8 @@ impl Strip {
             auto_db: 0.0,
             isolator: Isolator::new(rate),
             sweep: SweepFilter::new(rate),
+            cfx: Unit::new(rate, FxKind::Echo),
+            noise: 0x9e37_79b9,
             meter: [Meter::default(); 2],
         }
     }
@@ -152,6 +212,9 @@ pub struct DeckState {
     pub cue: f64,
     pub at_cue: bool,
     pub hotcues: [Option<f64>; HOTCUES],
+    pub memory: [Option<Mem>; MEMS],
+    pub key_shift: i8,
+    pub rolling: bool,
     #[serde(rename = "loop")]
     pub lp: Option<Loop>,
     pub loop_in: Option<f64>,
@@ -197,6 +260,12 @@ pub struct State {
     pub fx: Vec<FxState>,
     pub quantize: bool,
     pub auto_gain: bool,
+    pub smart_fader: bool,
+    pub smart_cfx: bool,
+    pub cfx: Cfx,
+    pub sampler_loaded: [bool; SLOTS],
+    pub sampler_playing: [bool; SLOTS],
+    pub sampler_volume: f32,
     /// Seconds of audio rendered since start: the clock positions belong to.
     pub clock: f64,
     pub rate: f64,
@@ -218,6 +287,10 @@ pub struct Engine {
     master_cue: bool,
     quantize: bool,
     auto_gain: bool,
+    smart_fader: bool,
+    smart_cfx: bool,
+    cfx: Cfx,
+    sampler: Sampler,
     /// Tempo (BPM) synced decks follow.
     sync_bpm: Option<f64>,
     limiter: Limiter,
@@ -273,6 +346,10 @@ impl Engine {
             master_cue: false,
             quantize: true,
             auto_gain: true,
+            smart_fader: false,
+            smart_cfx: false,
+            cfx: Cfx::default(),
+            sampler: Sampler::default(),
             sync_bpm: None,
             limiter: Limiter::new(r),
             limiting: 1.0,
@@ -300,6 +377,7 @@ impl Engine {
         for s in &mut self.strips {
             s.isolator = Isolator::new(r);
             s.sweep = SweepFilter::new(r);
+            s.cfx = Unit::new(r, FxKind::Echo);
         }
         for u in &mut self.fx {
             let mut fresh = Unit::new(r, u.kind);
@@ -312,10 +390,12 @@ impl Engine {
     /// Hand a song (and its stems) to another thread to free: freeing a
     /// few hundred megabytes here would stall the sound card.
     fn discard(&self, (track, stems): (Option<Arc<TrackAudio>>, Option<Arc<Stems>>)) {
-        if let Some(s) = stems.as_ref() {
+        // Stop separating it, unless the other deck plays the same song
+        // (an instant double shares the stems).
+        if let Some(s) = stems.as_ref().filter(|s| !self.decks.iter().any(|k| k.stems.as_ref().is_some_and(|x| Arc::ptr_eq(x, s)))) {
             s.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        let _ = self.trash.send(Garbage(track, stems));
+        let _ = self.trash.send(Garbage(track, stems, None));
     }
 
     fn other(d: usize) -> usize {
@@ -332,7 +412,53 @@ impl Engine {
         self.sync_bpm = Some(lead_bpm.unwrap_or(g.bpm * self.decks[d].tempo));
         self.decks[d].sync = true;
         self.apply_sync();
-        self.align(d);
+        // A waiting deck stays exactly on its cue point: it is lined up
+        // with the beat when it starts, not before.
+        if self.decks[d].playing {
+            self.align(d);
+        }
+    }
+
+    /// Smart Fader. Returns each deck's bass level.
+    fn smart(&mut self, xl: f32, xr: f32) -> [f32; DECKS] {
+        let low = [1.0; DECKS];
+        if !self.smart_fader {
+            return low;
+        }
+        let level = |d: usize| {
+            let s = &self.strips[d];
+            dsp::fader_gain(s.fader) * match s.side {
+                -1 => xl,
+                1 => xr,
+                _ => 1.0,
+            }
+        };
+        let (ga, gb) = (level(0), level(1));
+        let grid = |d: usize| self.decks[d].grid.filter(|_| self.decks[d].track.is_some());
+        let (Some(a), Some(b)) = (grid(0), grid(1)) else { return low };
+        if ga + gb <= 0.0 {
+            return low;
+        }
+        // How far the mix has moved from deck 1 (0) to deck 2 (1).
+        let m = (gb / (ga + gb)) as f64;
+        let from = a.bpm * self.decks[0].own_tempo();
+        let mut to = b.bpm * self.decks[1].own_tempo();
+        while to > from * 1.5 {
+            to /= 2.0;
+        }
+        while to < from * 0.67 {
+            to *= 2.0;
+        }
+        self.sync_bpm = Some(from + (to - from) * m);
+        self.decks[0].sync = true;
+        self.decks[1].sync = true;
+        if !(self.decks[0].playing && self.decks[1].playing) {
+            return low;
+        }
+        // Basslines swap around the middle, so two never play at once.
+        let x = ((m - 0.35) / 0.3).clamp(0.0, 1.0);
+        let swap = (x * x * (3.0 - 2.0 * x)) as f32;
+        [1.0 - swap, swap]
     }
 
     /// Put `d`'s beats on the other deck's, if that one is playing.
@@ -529,6 +655,50 @@ impl Engine {
             }
             AutoGain { on } => self.auto_gain = on,
             Stems { d, gains } if ok(d) => self.decks[d].stem_gain = gains.map(|g| g.clamp(0.0, 1.0)),
+            BackCue { d } if ok(d) => self.decks[d].back_cue(),
+            LoopRoll { d, beats, down } if ok(d) => self.decks[d].loop_roll(beats, down, q),
+            KeyShift { d, semitones } if ok(d) => self.decks[d].set_key_shift(semitones),
+            MemStore { d } if ok(d) => {
+                self.decks[d].mem_store(q);
+            }
+            MemCall { d, dir } if ok(d) => {
+                self.decks[d].mem_call(dir);
+            }
+            MemDelete { d } if ok(d) => {
+                self.decks[d].mem_delete();
+            }
+            SmartFader { on } => {
+                if self.smart_fader && !on {
+                    // Each deck goes back to its own tempo fader.
+                    for deck in &mut self.decks {
+                        deck.sync = false;
+                    }
+                }
+                self.smart_fader = on;
+            }
+            SmartCfx { on } => self.smart_cfx = on,
+            CfxKind { kind } => self.cfx = kind,
+            Sample { n } => self.sampler.trigger(n),
+            SampleStop { n } => self.sampler.stop(n),
+            SamplerVolume { v } => self.sampler.volume = v.clamp(0.0, 1.0),
+            Double { d } if ok(d) && !self.decks[d].playing => {
+                let o = Self::other(d);
+                let src = &self.decks[o];
+                let Some(track) = src.track.clone() else { return };
+                let (stems, grid, cue, hotcues, memory) = (src.stems.clone(), src.grid, src.cue, src.hotcues, src.memory);
+                let (pos, playing, sync) = (src.pos, src.playing, src.sync);
+                let (pitch, range, keylock, key_shift, tempo) = (src.pitch, src.range, src.keylock, src.key_shift, src.tempo);
+                let old = self.decks[d].load(track, stems, grid, cue, hotcues);
+                let deck = &mut self.decks[d];
+                deck.memory = memory;
+                (deck.pitch, deck.range, deck.keylock, deck.key_shift, deck.tempo, deck.sync) = (pitch, range, keylock, key_shift, tempo, sync);
+                deck.pos = pos;
+                if playing {
+                    deck.play();
+                }
+                self.strips[d].auto_db = self.strips[o].auto_db;
+                self.discard(old);
+            }
             _ => {}
         }
     }
@@ -536,12 +706,17 @@ impl Engine {
     fn command(&mut self, cmd: Cmd) {
         match cmd {
             Cmd::Control(c) => self.control(c),
-            Cmd::Load { d, track, stems, grid, cue, hotcues, gain_db } if d < DECKS => {
+            Cmd::Sample { n, sample } => {
+                let old = self.sampler.set(n, sample);
+                let _ = self.trash.send(Garbage(None, None, old));
+            }
+            Cmd::Load { d, track, stems, grid, cue, hotcues, memory, gain_db } if d < DECKS => {
                 if self.decks[d].playing {
                     return; // never swap the song out from under a playing deck
                 }
                 let was_synced = self.decks[d].sync;
                 let old = self.decks[d].load(track, stems, grid, cue, hotcues);
+                self.decks[d].memory = memory;
                 self.strips[d].auto_db = gain_db;
                 self.discard(old);
                 if was_synced {
@@ -591,6 +766,8 @@ impl Engine {
         }
         let frames = master.len() / 2;
         let secs = frames as f64 / self.rate;
+        let (xl, xr) = dsp::crossfade(self.crossfader, self.curve);
+        let bass = self.smart(xl, xr);
         self.apply_sync();
         // A deck that just started playing while synced lands on the beat.
         for d in 0..DECKS {
@@ -601,7 +778,6 @@ impl Engine {
         self.phase_lock();
         master.fill(0.0);
         cue.fill(0.0);
-        let (xl, xr) = dsp::crossfade(self.crossfader, self.curve);
         let mut bufs = std::mem::take(&mut self.bufs);
         for d in 0..DECKS {
             let buf = &mut bufs[d][..frames * 2];
@@ -612,10 +788,39 @@ impl Engine {
             for v in buf.iter_mut() {
                 *v *= gain;
             }
-            s.isolator.run(buf, [dsp::eq_gain(s.eq[0]), dsp::eq_gain(s.eq[1]), dsp::eq_gain(s.eq[2])]);
-            s.sweep.run(buf, s.filter);
-            // Effects on this deck, timed by its beat.
+            s.isolator.run(buf, [dsp::eq_gain(s.eq[0]) * bass[d], dsp::eq_gain(s.eq[1]), dsp::eq_gain(s.eq[2])]);
             let beat = self.decks[d].bpm().map_or(0.5, |b| 60.0 / b) as f32;
+            // Smart CFX: how far the knob is from the middle drives an
+            // effect as well as the filter.
+            let amount = if self.smart_cfx { ((s.filter.abs() - 0.02) / 0.98).max(0.0) } else { 0.0 };
+            if amount > 0.0 && self.cfx == Cfx::Noise {
+                // A hiss that swells with the knob, swept by the filter.
+                let g = amount * amount * 0.22;
+                for v in buf.iter_mut() {
+                    s.noise ^= s.noise << 13;
+                    s.noise ^= s.noise >> 17;
+                    s.noise ^= s.noise << 5;
+                    *v += (s.noise as f32 / u32::MAX as f32 * 2.0 - 1.0) * g;
+                }
+            }
+            s.sweep.run(buf, s.filter);
+            let (kind, beats) = match self.cfx {
+                Cfx::Echo | Cfx::Noise => (FxKind::LowCutEcho, 3),
+                Cfx::Space => (FxKind::Reverb, 6),
+                Cfx::Crush => (FxKind::Crush, 4),
+                Cfx::Jet => (FxKind::Flanger, 6),
+            };
+            let on = amount > 0.01 && self.cfx != Cfx::Noise;
+            if on {
+                s.cfx.set_kind(kind);
+                s.cfx.beats = beats;
+                s.cfx.depth = amount;
+            }
+            s.cfx.on = on;
+            if s.cfx.active() {
+                s.cfx.run(buf, beat);
+            }
+            // Effects on this deck, timed by its beat.
             for u in &mut self.fx {
                 if u.assign & (1 << d) != 0 {
                     u.run(buf, beat);
@@ -647,6 +852,7 @@ impl Engine {
                 }
             }
         }
+        self.sampler.render(master, self.rate);
         // Master effects, timed by whichever deck is loudest in the mix.
         let lead = (0..DECKS)
             .filter(|&d| self.decks[d].playing)
@@ -727,6 +933,9 @@ impl Engine {
                 cue: deck.cue,
                 at_cue: deck.at_cue(),
                 hotcues: deck.hotcues,
+                memory: deck.memory,
+                key_shift: deck.key_shift,
+                rolling: deck.rolling,
                 lp: deck.lp,
                 loop_in: deck.loop_in,
                 slip: deck.slip,
@@ -761,6 +970,12 @@ impl Engine {
         }
         st.quantize = self.quantize;
         st.auto_gain = self.auto_gain;
+        st.smart_fader = self.smart_fader;
+        st.smart_cfx = self.smart_cfx;
+        st.cfx = self.cfx;
+        st.sampler_loaded = self.sampler.loaded();
+        st.sampler_playing = self.sampler.playing();
+        st.sampler_volume = self.sampler.volume;
         st.clock = self.clock;
         st.load = self.load_shown;
         st.rate = self.rate;
@@ -805,8 +1020,8 @@ mod tests {
         let b = click_track(120.0, 60.0);
         let ga = Grid { bpm: 124.0, anchor: 0.0 };
         let gb = Grid { bpm: 120.0, anchor: 0.0 };
-        h.tx.send(Cmd::Load { d: 0, track: a, stems: None, grid: Some(ga), cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
-        h.tx.send(Cmd::Load { d: 1, track: b, stems: None, grid: Some(gb), cue: 1234.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 0, track: a, stems: None, grid: Some(ga), cue: 0.0, hotcues: [None; 8], memory: [None; MEMS], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 1, track: b, stems: None, grid: Some(gb), cue: 1234.0, hotcues: [None; 8], memory: [None; MEMS], gain_db: 0.0 }).unwrap();
         h.send(Control::Play { d: 0 });
         render(&mut e, 2.3);
         h.send(Control::Sync { d: 1, on: Some(true) });
@@ -830,7 +1045,7 @@ mod tests {
     #[test]
     fn crossfader_and_cue_routing() {
         let (mut e, h, _g) = Engine::new(44_100.0);
-        h.tx.send(Cmd::Load { d: 0, track: click_track(120.0, 10.0), stems: None, grid: None, cue: 0.0, hotcues: [None; 8], gain_db: 0.0 }).unwrap();
+        h.tx.send(Cmd::Load { d: 0, track: click_track(120.0, 10.0), stems: None, grid: None, cue: 0.0, hotcues: [None; 8], memory: [None; MEMS], gain_db: 0.0 }).unwrap();
         h.send(Control::Play { d: 0 });
         h.send(Control::Crossfader { v: 1.0 });
         h.send(Control::Curve { curve: Curve::Sharp });
@@ -845,5 +1060,156 @@ mod tests {
             heard = heard.max(c.iter().fold(0.0, |a, v| a.max(v.abs())));
         }
         assert!(heard > 0.1, "cue bus carries the deck: {heard}");
+    }
+
+    fn load(h: &Handle, d: usize, bpm: f64, cue: f64) -> Grid {
+        let grid = Grid { bpm, anchor: 0.0 };
+        h.tx.send(Cmd::Load { d, track: click_track(bpm, 60.0), stems: None, grid: Some(grid), cue, hotcues: [None; 8], memory: [None; MEMS], gain_db: 0.0 }).unwrap();
+        grid
+    }
+
+    #[test]
+    fn a_waiting_synced_deck_stays_on_its_cue() {
+        // The pre-cue case: deck 1 plays, deck 2 waits at its cue with SYNC
+        // on. Turning sync on (or loading with it on) must not move deck 2
+        // off the cue point; it is lined up when it starts.
+        let (mut e, h, _g) = Engine::new(44_100.0);
+        load(&h, 0, 124.0, 0.0);
+        let gb = load(&h, 1, 120.0, 5_000.0);
+        h.send(Control::Play { d: 0 });
+        render(&mut e, 1.7);
+        h.send(Control::Sync { d: 1, on: Some(true) });
+        render(&mut e, 0.3);
+        let st = h.snapshot();
+        assert!(st.decks[1].at_cue && (st.decks[1].pos - 5_000.0).abs() < 1.0, "moved to {}", st.decks[1].pos);
+        assert!((st.decks[1].tempo * 120.0 - 124.0).abs() < 0.01, "tempo already matched");
+        // Loading another song onto the synced deck: same.
+        load(&h, 1, 120.0, 7_000.0);
+        render(&mut e, 0.2);
+        let st = h.snapshot();
+        assert!(st.decks[1].sync && st.decks[1].at_cue, "at {}", st.decks[1].pos);
+        // Holding CUE previews from the cue, in time; letting go returns.
+        h.send(Control::Cue { d: 1, down: true });
+        render(&mut e, 0.5);
+        let st = h.snapshot();
+        let (p0, p1) = (Grid { bpm: 124.0, anchor: 0.0 }.phase(st.decks[0].pos), gb.phase(st.decks[1].pos));
+        let diff = (p0 - p1).abs().min(1.0 - (p0 - p1).abs());
+        assert!(st.decks[1].playing && diff < 0.02, "preview {diff} beats off");
+        h.send(Control::Cue { d: 1, down: false });
+        render(&mut e, 0.1);
+        let st = h.snapshot();
+        assert!(!st.decks[1].playing && (st.decks[1].pos - 7_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn headphones_hear_the_cued_deck_before_the_room_does() {
+        let (mut e, h, _g) = Engine::new(44_100.0);
+        load(&h, 0, 124.0, 0.0);
+        load(&h, 1, 120.0, 0.0);
+        h.send(Control::Play { d: 0 });
+        // Deck 2: fader down, headphone cue on, playing.
+        h.send(Control::Fader { d: 1, v: 0.0 });
+        h.send(Control::Pfl { d: 1, on: true });
+        h.send(Control::Play { d: 1 });
+        h.send(Control::Fader { d: 0, v: 0.0 });
+        let mut m = vec![0.0; 512];
+        let mut c = vec![0.0; 512];
+        let (mut room, mut phones) = (0.0f32, 0.0f32);
+        for _ in 0..300 {
+            e.render(&mut m, &mut c);
+            room = room.max(m.iter().fold(0.0, |a, v| a.max(v.abs())));
+            phones = phones.max(c.iter().fold(0.0, |a, v| a.max(v.abs())));
+        }
+        assert!(room < 1e-6, "nothing in the room with both faders down: {room}");
+        assert!(phones > 0.1, "deck 2 in the headphones: {phones}");
+    }
+
+    #[test]
+    fn instant_double_copies_the_other_deck() {
+        let (mut e, h, _g) = Engine::new(44_100.0);
+        load(&h, 0, 124.0, 0.0);
+        h.send(Control::Pitch { d: 0, v: 0.5 });
+        h.send(Control::Play { d: 0 });
+        render(&mut e, 1.0);
+        h.send(Control::Double { d: 1 });
+        render(&mut e, 0.5);
+        let st = h.snapshot();
+        let (a, b) = (&st.decks[0], &st.decks[1]);
+        assert!(b.loaded && b.playing && b.track_key == a.track_key);
+        assert!((a.pos - b.pos).abs() < 2.0, "{} vs {}", a.pos, b.pos);
+        assert!((a.tempo - b.tempo).abs() < 1e-9 && b.pitch == 0.5);
+        // Never over a playing deck.
+        h.send(Control::Eject { d: 0 });
+        h.send(Control::Double { d: 0 });
+        render(&mut e, 0.1);
+        assert!(h.snapshot().decks[0].loaded);
+    }
+
+    #[test]
+    fn smart_fader_glides_the_tempo_and_swaps_the_bass() {
+        let (mut e, h, _g) = Engine::new(44_100.0);
+        load(&h, 0, 120.0, 0.0);
+        load(&h, 1, 128.0, 0.0);
+        h.send(Control::SmartFader { on: true });
+        h.send(Control::Play { d: 0 });
+        h.send(Control::Play { d: 1 });
+        let bpm = |st: &State, d: usize| st.decks[d].grid.unwrap().bpm * st.decks[d].tempo;
+        for (x, want) in [(0.0, 120.0), (1.0, 128.0)] {
+            h.send(Control::Crossfader { v: x });
+            render(&mut e, 0.2);
+            let st = h.snapshot();
+            assert!((bpm(&st, 0) - want).abs() < 0.01 && (bpm(&st, 1) - want).abs() < 0.01, "at {x}: {} / {}", bpm(&st, 0), bpm(&st, 1));
+        }
+        h.send(Control::Crossfader { v: 0.5 });
+        render(&mut e, 0.2);
+        let st = h.snapshot();
+        assert!((bpm(&st, 0) - 124.0).abs() < 0.01, "halfway: {}", bpm(&st, 0));
+        // Off: each deck back on its own tempo fader.
+        h.send(Control::SmartFader { on: false });
+        render(&mut e, 0.2);
+        let st = h.snapshot();
+        assert!(!st.decks[0].sync && !st.decks[1].sync && (bpm(&st, 1) - 128.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn sampler_pads_play_into_the_master() {
+        let (mut e, h, _g) = Engine::new(44_100.0);
+        let tone: Vec<f32> = (0..44_100).flat_map(|i| { let v = (i as f32 * 0.1).sin() * 0.5; [v, v] }).collect();
+        h.tx.send(Cmd::Sample { n: 2, sample: Some(Arc::new(Sample { name: "tone".into(), data: tone })) }).unwrap();
+        let quiet = render(&mut e, 0.2);
+        assert!(quiet.iter().all(|v| v.abs() < 1e-6));
+        h.send(Control::Sample { n: 2 });
+        let out = render(&mut e, 0.2);
+        assert!(out.iter().fold(0.0f32, |m, v| m.max(v.abs())) > 0.1);
+        assert!(h.snapshot().sampler_playing[2] && h.snapshot().sampler_loaded[2]);
+        h.send(Control::SampleStop { n: 2 });
+        render(&mut e, 0.2);
+        assert!(!h.snapshot().sampler_playing[2]);
+        let after = render(&mut e, 0.1);
+        assert!(after.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn smart_cfx_adds_an_effect_only_when_on() {
+        // A click, then silence: with Smart CFX the echo answers back.
+        let run = |smart: bool| -> f32 {
+            let (mut e, h, _g) = Engine::new(44_100.0);
+            let t = TrackAudio::new(4_000);
+            let mut data = vec![0.0f32; 44_100 * 2 * 4];
+            for v in data.iter_mut().take(4_000) {
+                *v = 0.6;
+            }
+            t.push(&data);
+            t.done.store(true, Ordering::Release);
+            h.tx.send(Cmd::Load { d: 0, track: Arc::new(t), stems: None, grid: Some(Grid { bpm: 120.0, anchor: 0.0 }), cue: 0.0, hotcues: [None; 8], memory: [None; MEMS], gain_db: 0.0 }).unwrap();
+            h.send(Control::SmartCfx { on: smart });
+            h.send(Control::Filter { d: 0, v: 0.3 });
+            h.send(Control::Play { d: 0 });
+            let out = render(&mut e, 1.5);
+            // Loudest thing after the click has passed.
+            out[44_100..].iter().fold(0.0f32, |m, v| m.max(v.abs()))
+        };
+        assert!(run(false) < 0.01, "plain filter leaves silence: {}", run(false));
+        assert!(run(true) > 0.02, "echo repeats: {}", run(true));
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::Analysis;
-use crate::engine::deck::{Grid, HOTCUES};
+use crate::engine::deck::{Grid, HOTCUES, MEMS, Mem};
 use crate::paths;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -19,6 +19,8 @@ pub struct TrackData {
     pub grid: Option<Grid>,
     pub cue: Option<f64>,
     pub hotcues: [Option<f64>; HOTCUES],
+    /// Memory cues (the CUE/LOOP CALL buttons).
+    pub memory: [Option<Mem>; MEMS],
 }
 
 /// What library rows show.

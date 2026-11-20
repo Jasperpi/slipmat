@@ -2,6 +2,7 @@
 //! session, the engine, the sound card, what's on each deck.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -86,6 +87,54 @@ pub enum Event {
     Analysed { id: String, bpm: f64, key: Option<u8> },
     /// A list shown from the saved copy turned out different: fetch it again.
     ListChanged { list: String },
+    /// SHIFT + LOAD on the controller: sort the song list by this column.
+    Sort { by: &'static str },
+}
+
+/// Things the controller asks for that need to know what's on the decks.
+#[derive(Clone, Copy, Debug)]
+pub enum Action {
+    /// Instant double: the other deck's song onto `d`, at the same place.
+    Double { d: usize },
+    /// Shift deck `d`'s key to go with the other deck's.
+    KeySync { d: usize },
+    AutoDjToggle,
+}
+
+/// A song that was played to the room, and when.
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct Played {
+    pub at: i64,
+    pub row: Row,
+}
+
+/// Seconds a song has to be heard before it counts as played.
+const PLAYED_AFTER: u32 = 20;
+const HISTORY_MAX: usize = 1000;
+
+fn history_path() -> std::path::PathBuf {
+    crate::paths::data().join("history.json")
+}
+
+/// Semitones (the fewest, at most six either way) that bring key `from`
+/// to `to` or to its relative major/minor. Keys are 0-11 major from C,
+/// 12-23 minor from C.
+pub fn key_match(from: u8, to: u8) -> i8 {
+    let shifted = |k: u8, by: i8| -> u8 {
+        let base = if k >= 12 { 12 } else { 0 };
+        base + ((k - base) as i8 + by).rem_euclid(12) as u8
+    };
+    // C major and A minor share their notes: minor root = major root + 9.
+    let relative = |k: u8| if k >= 12 { (k - 12 + 3) % 12 } else { 12 + (k + 9) % 12 };
+    let mut best = 0i8;
+    for by in [0i8, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6] {
+        let k = shifted(from, by);
+        if k == to || k == relative(to) {
+            best = by;
+            break;
+        }
+    }
+    best
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -115,6 +164,14 @@ pub struct App {
     pub batch: Mutex<BatchStatus>,
     batch_tx: tokio::sync::mpsc::UnboundedSender<String>,
     lists: Mutex<HashMap<String, (Instant, Vec<Row>)>>,
+    /// Counts loads per deck, so only the latest one asked for lands.
+    load_gen: [AtomicU64; DECKS],
+    doubled_at: Mutex<[Option<Instant>; DECKS]>,
+    /// Names of the sounds on the sampler pads.
+    pub sampler_names: Vec<String>,
+    pub history: Mutex<Vec<Played>>,
+    /// Songs played since Slipmat started (their ids).
+    pub played: Mutex<Vec<String>>,
 }
 
 fn auto_gain(a: &Analysis) -> f32 {
@@ -142,6 +199,15 @@ impl App {
         }
         handle.send(Control::Quantize { on: settings.quantize });
         handle.send(Control::AutoGain { on: settings.auto_gain });
+        // The sampler's sounds: built in, or your own WAV files.
+        let samples_dir = crate::paths::config().join("samples");
+        let _ = std::fs::create_dir_all(&samples_dir);
+        let bank = crate::engine::sampler::bank(&samples_dir);
+        let sampler_names = bank.iter().map(|s| s.name.clone()).collect();
+        for (n, sample) in bank.into_iter().enumerate() {
+            let _ = handle.tx.send(Cmd::Sample { n, sample: Some(sample) });
+        }
+        let history: Vec<Played> = std::fs::read(history_path()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let (events, _) = broadcast::channel(256);
         let (batch_tx, batch_rx) = tokio::sync::mpsc::unbounded_channel();
         let app = Arc::new(Self {
@@ -157,6 +223,11 @@ impl App {
             batch: Mutex::new(BatchStatus::default()),
             batch_tx,
             lists: Mutex::new(HashMap::new()),
+            load_gen: Default::default(),
+            doubled_at: Mutex::new([None; DECKS]),
+            sampler_names,
+            history: Mutex::new(history),
+            played: Mutex::new(Vec::new()),
         });
         app.spotify.resume();
         tokio::spawn(app.clone().keep_cues());
@@ -344,16 +415,26 @@ impl App {
 
     /// Load a Spotify song onto a deck.
     pub async fn load(self: &Arc<Self>, d: usize, uri: &str) -> Result<Track> {
+        self.load_attempt(d, uri, 0).await
+    }
+
+    async fn load_attempt(self: &Arc<Self>, d: usize, uri: &str, attempt: u32) -> Result<Track> {
         if d >= DECKS {
             bail!("no deck {}", d + 1);
         }
         if self.engine.snapshot().decks.get(d).is_some_and(|s| s.playing) {
             bail!("Deck {} is playing. Pause it first.", d + 1);
         }
+        // If another song is asked for while this one is being fetched,
+        // that one wins.
+        let turn = self.load_gen[d].fetch_add(1, Ordering::SeqCst) + 1;
         let session = self.spotify.session().await?;
         let track = spot::tracks(&session, &[uri.to_string()]).await.into_iter().next().ok_or_else(|| anyhow!("song not found"))?;
         if !track.playable {
             bail!("“{}” can't be played here", track.name);
+        }
+        if self.load_gen[d].load(Ordering::SeqCst) != turn {
+            bail!("“{}” was replaced by the next song loaded onto deck {}", track.name, d + 1);
         }
         let audio = loader::load(&session, uri, track.duration_ms)?;
         // Split into stems in the background, as the song arrives.
@@ -367,20 +448,40 @@ impl App {
         let grid = saved.grid.or(saved.analysis.as_ref().map(|a| Grid { bpm: a.bpm, anchor: a.anchor }));
         let cue = saved.cue.or(saved.analysis.as_ref().map(auto_cue)).unwrap_or(0.0);
         let gain_db = saved.analysis.as_ref().map(auto_gain).unwrap_or(0.0);
-        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), stems: stems.clone(), grid, cue, hotcues: saved.hotcues, gain_db })?;
+        self.engine.tx.send(Cmd::Load { d, track: audio.clone(), stems: stems.clone(), grid, cue, hotcues: saved.hotcues, memory: saved.memory, gain_db })?;
         let analysing = saved.analysis.is_none();
         self.decks.lock().unwrap()[d] = Some(OnDeck { track: track.clone(), audio: audio.clone(), stems, analysis: saved.analysis.clone(), analysing });
         let app = self.clone();
+        let uri = uri.to_string();
         let id = track.id.clone();
-        tokio::spawn(async move { app.after_load(d, id, audio, analysing).await });
+        tokio::spawn(async move { app.after_load(d, uri, id, audio, analysing, attempt).await });
         Ok(track)
     }
 
+    /// Try a song that wouldn't download once more (boxed: it loops back
+    /// into loading).
+    fn retry(self: Arc<Self>, d: usize, uri: String, attempt: u32) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            if let Err(e) = self.load_attempt(d, &uri, attempt).await {
+                self.notice(e.to_string(), true);
+            }
+        })
+    }
+
     /// Wait for the song to finish decoding, then analyse it if it's new.
-    async fn after_load(self: Arc<Self>, d: usize, id: String, audio: Arc<TrackAudio>, analyse: bool) {
-        while !audio.done.load(std::sync::atomic::Ordering::Acquire) {
-            if audio.failed.load(std::sync::atomic::Ordering::Acquire) {
-                self.notice("That song wouldn't download from Spotify. Try again, or pick another.", true);
+    async fn after_load(self: Arc<Self>, d: usize, uri: String, id: String, audio: Arc<TrackAudio>, analyse: bool, attempt: u32) {
+        while !audio.done.load(Ordering::Acquire) {
+            if audio.failed.load(Ordering::Acquire) {
+                // Spotify drops a download now and then: try again, as long
+                // as the deck is still waiting for this song.
+                let waiting = self.engine.snapshot().decks.get(d).is_some_and(|s| s.track_key == Arc::as_ptr(&audio) as usize && !s.playing);
+                if waiting && attempt < 2 {
+                    self.notice("Spotify dropped that download; trying again…", false);
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                    self.clone().retry(d, uri, attempt + 1).await;
+                } else {
+                    self.notice("That song wouldn't download from Spotify. Try again, or pick another.", true);
+                }
                 return;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -389,25 +490,101 @@ impl App {
             return;
         }
         let a = audio.clone();
-        let Ok(Some(result)) = tokio::task::spawn_blocking(move || {
+        let result = tokio::task::spawn_blocking(move || {
             crate::priority::background();
             analysis::analyse(&a.mono())
-        }).await else {
-            if let Some(Some(on)) = self.decks.lock().unwrap().get_mut(d) {
-                on.analysing = false;
+        })
+        .await
+        .ok()
+        .flatten();
+        // The same song may be on both decks (an instant double).
+        let on_decks = |f: &dyn Fn(&mut OnDeck)| {
+            for on in self.decks.lock().unwrap().iter_mut().flatten() {
+                if Arc::ptr_eq(&on.audio, &audio) {
+                    f(on);
+                }
             }
+        };
+        let Some(result) = result else {
+            on_decks(&|on| on.analysing = false);
             return;
         };
         self.store.update(&id, |t| t.analysis = Some(result.clone()));
         let grid = Grid { bpm: result.bpm, anchor: result.anchor };
-        let _ = self.engine.tx.send(Cmd::Analysed { d, track: audio.clone(), grid, cue: Some(auto_cue(&result)), gain_db: auto_gain(&result) });
-        if let Some(Some(on)) = self.decks.lock().unwrap().get_mut(d) {
-            if Arc::ptr_eq(&on.audio, &audio) {
-                on.analysis = Some(result.clone());
-                on.analysing = false;
+        for deck in 0..DECKS {
+            let _ = self.engine.tx.send(Cmd::Analysed { d: deck, track: audio.clone(), grid, cue: Some(auto_cue(&result)), gain_db: auto_gain(&result) });
+        }
+        on_decks(&|on| {
+            on.analysis = Some(result.clone());
+            on.analysing = false;
+        });
+        let _ = self.events.send(Event::Analysed { id, bpm: result.bpm, key: result.key });
+    }
+
+    /// LOAD pressed twice asks for a double; the first press also asked the
+    /// page to load the highlighted song, which must then be ignored.
+    pub fn doubled_recently(&self, d: usize) -> bool {
+        self.doubled_at.lock().unwrap().get(d).copied().flatten().is_some_and(|at| at.elapsed() < Duration::from_millis(900))
+    }
+
+    pub fn act(self: &Arc<Self>, action: Action) {
+        match action {
+            Action::Double { d } => self.double(d),
+            Action::KeySync { d } => self.key_sync(d),
+            Action::AutoDjToggle => {
+                let on = !self.autodj.on.load(Ordering::Relaxed);
+                self.autodj.on.store(on, Ordering::Relaxed);
+                self.notice(if on { "Auto-DJ on" } else { "Auto-DJ off" }, false);
             }
         }
-        let _ = self.events.send(Event::Analysed { id, bpm: result.bpm, key: result.key });
+    }
+
+    /// Instant double: the other deck's song, at the same place and tempo.
+    pub fn double(self: &Arc<Self>, d: usize) {
+        if d >= DECKS {
+            return;
+        }
+        let o = (d + 1) % DECKS;
+        if self.engine.snapshot().decks.get(d).is_some_and(|s| s.playing) {
+            return self.notice(format!("Deck {} is playing. Pause it first.", d + 1), true);
+        }
+        let Some(src) = self.decks.lock().unwrap()[o].clone() else {
+            return self.notice(format!("Nothing on deck {} to double", o + 1), true);
+        };
+        // Cancels a load still on its way to this deck.
+        self.load_gen[d].fetch_add(1, Ordering::SeqCst);
+        self.doubled_at.lock().unwrap()[d] = Some(Instant::now());
+        let name = src.track.name.clone();
+        self.decks.lock().unwrap()[d] = Some(src);
+        self.engine.send(Control::Double { d });
+        self.notice(format!("Deck {}: instant double of “{name}”", d + 1), false);
+    }
+
+    /// Key sync: shift deck `d` the few semitones that make it harmonise
+    /// with the other deck.
+    pub fn key_sync(&self, d: usize) {
+        if d >= DECKS {
+            return;
+        }
+        let o = (d + 1) % DECKS;
+        let keys: Vec<Option<u8>> = self.decks.lock().unwrap().iter().map(|on| on.as_ref().and_then(|on| on.analysis.as_ref()).and_then(|a| a.key)).collect();
+        let (Some(mine), Some(theirs)) = (keys[d], keys[o]) else {
+            return self.notice("Key sync needs both songs' keys (still analysing?)", true);
+        };
+        // The other deck may itself be shifted.
+        let st = self.engine.snapshot();
+        let theirs_now = {
+            let by = st.decks.get(o).map_or(0, |s| s.key_shift);
+            let base = if theirs >= 12 { 12 } else { 0 };
+            base + ((theirs - base) as i8 + by).rem_euclid(12) as u8
+        };
+        let by = key_match(mine, theirs_now);
+        self.engine.send(Control::KeyShift { d, semitones: by });
+        let text = match by {
+            0 => format!("Deck {}: already in a key that fits", d + 1),
+            _ => format!("Deck {}: key shifted {by:+} to fit deck {}", d + 1, o + 1),
+        };
+        self.notice(text, false);
     }
 
     /// Analyse songs without loading them (for the BPM and key columns).
@@ -472,26 +649,81 @@ impl App {
 
     /// Save cue points, hot cues and grid edits as they change.
     async fn keep_cues(self: Arc<Self>) {
+        // Per deck: the song being counted, seconds heard, already logged.
+        let mut heard = [(0usize, 0u32, false); DECKS];
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
             stems::release_idle();
             let st = self.engine.snapshot();
             let decks = self.decks.lock().unwrap().clone();
+            let (xl, xr) = crate::engine::dsp::crossfade(st.crossfader, st.curve);
             for (d, on) in decks.iter().enumerate() {
                 let (Some(on), Some(s)) = (on, st.decks.get(d)) else { continue };
                 // Only once the engine has the same song.
                 if s.track_key != Arc::as_ptr(&on.audio) as usize {
                     continue;
                 }
+                // History: a song counts once the room has heard it a while.
+                let h = &mut heard[d];
+                if h.0 != s.track_key {
+                    *h = (s.track_key, 0, false);
+                }
+                let side = match s.side {
+                    -1 => xl,
+                    1 => xr,
+                    _ => 1.0,
+                };
+                if s.playing && s.fader * side > 0.05 && st.master > 0.0 {
+                    h.1 += 1;
+                    if h.1 >= PLAYED_AFTER && !h.2 {
+                        h.2 = true;
+                        self.log_played(&on.track);
+                    }
+                }
                 self.store.update(&on.track.id, |t| {
                     t.cue = Some(s.cue);
                     t.hotcues = s.hotcues;
+                    t.memory = s.memory;
                     if s.grid.is_some() {
                         t.grid = s.grid;
                     }
                 });
             }
         }
+    }
+
+    fn log_played(&self, track: &Track) {
+        // Both decks playing the same song (a double) is one play.
+        let mut played = self.played.lock().unwrap();
+        if played.last() == Some(&track.id) {
+            return;
+        }
+        played.push(track.id.clone());
+        drop(played);
+        let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let mut history = self.history.lock().unwrap();
+        history.push(Played { at, row: self.row(track) });
+        let extra = history.len().saturating_sub(HISTORY_MAX);
+        history.drain(..extra);
+        if let Ok(bytes) = serde_json::to_vec(&*history) {
+            let path = history_path();
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
+    }
+
+    /// Everything played, newest first, with BPM and key as known now.
+    pub fn history_rows(&self) -> Vec<Row> {
+        let rows = self.history.lock().unwrap().iter().rev().map(|p| Row { added_at: Some(p.at), ..p.row.clone() }).collect();
+        self.with_analysis(rows)
+    }
+
+    pub fn clear_history(&self) {
+        self.history.lock().unwrap().clear();
+        self.played.lock().unwrap().clear();
+        let _ = std::fs::remove_file(history_path());
     }
 
     pub fn settings(&self) -> Settings {
@@ -512,5 +744,35 @@ impl App {
         new.save();
         *self.settings.lock().unwrap() = new;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_match;
+
+    #[test]
+    fn key_sync_finds_the_nearest_fitting_key() {
+        // C major (0) fits A minor (21) as it is.
+        assert_eq!(key_match(0, 21), 0);
+        assert_eq!(key_match(5, 5), 0);
+        // D major (2) to C major: down two.
+        assert_eq!(key_match(2, 0), -2);
+        // B minor (23) to C major (0): up one makes C minor? No: the fit is
+        // A minor, two down.
+        assert_eq!(key_match(23, 0), -2);
+        // F# major (6) to C major: six away, the furthest it ever goes.
+        assert_eq!(key_match(6, 0).abs(), 6);
+        // Whatever comes back really does fit.
+        for from in 0..24u8 {
+            for to in 0..24u8 {
+                let by = key_match(from, to);
+                let base = if from >= 12 { 12 } else { 0 };
+                let k = base + ((from - base) as i8 + by).rem_euclid(12) as u8;
+                let relative = if to >= 12 { (to - 12 + 3) % 12 } else { 12 + (to + 9) % 12 };
+                assert!(k == to || k == relative, "{from} -> {to} by {by} gave {k}");
+                assert!(by.abs() <= 6);
+            }
+        }
     }
 }

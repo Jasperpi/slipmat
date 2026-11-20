@@ -21,7 +21,11 @@ mod track;
 use std::io::Write;
 use std::sync::Mutex;
 
-pub const PORT: u16 = 4141;
+/// The page's port: 4141, or `SLIPMAT_PORT` (for running a second copy while testing).
+pub fn port() -> u16 {
+    static PORT: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *PORT.get_or_init(|| std::env::var("SLIPMAT_PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(4141))
+}
 
 const HELP: &str = "\
 slipmat — DJ with Spotify on your Pioneer controller
@@ -79,7 +83,10 @@ fn quiet_alsa() {
 
 fn main() {
     #[cfg(target_os = "linux")]
-    quiet_alsa();
+    {
+        quiet_alsa();
+        engine::output::pipewire::prepare();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
         print!("{HELP}");

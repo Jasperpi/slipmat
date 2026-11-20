@@ -21,7 +21,7 @@ use crate::app::App;
 use crate::engine::Control;
 use crate::engine::output;
 use crate::settings::Settings;
-use crate::PORT;
+use crate::port;
 
 #[derive(RustEmbed)]
 #[folder = "ui/"]
@@ -46,8 +46,9 @@ impl<E: Into<anyhow::Error>> From<E> for Fail {
 type Answer<T> = std::result::Result<T, Fail>;
 
 pub async fn run(open: bool) -> Result<()> {
-    let url = format!("http://127.0.0.1:{PORT}");
-    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", PORT)).await {
+    let port = port();
+    let url = format!("http://127.0.0.1:{port}");
+    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
         Ok(l) => l,
         Err(_) => {
             println!("Slipmat is already running: {url}");
@@ -67,6 +68,7 @@ pub async fn run(open: bool) -> Result<()> {
         .route("/api/playlists", get(playlists))
         .route("/api/playlist/{id}", get(playlist))
         .route("/api/search", get(search))
+        .route("/api/history", get(history).delete(clear_history))
         .route("/api/load", post(load))
         .route("/api/analyze", post(analyze))
         .route("/api/deck/{d}/wave", get(wave))
@@ -76,6 +78,7 @@ pub async fn run(open: bool) -> Result<()> {
         .route("/api/logout", post(logout))
         .route("/api/settings", get(settings).post(save_settings))
         .route("/api/devices", get(devices))
+        .route("/api/output/reconnect", post(reconnect))
         .route("/api/control", post(control))
         .route("/api/quit", post(quit))
         .route("/api/autodj", get(autodj_status).post(autodj))
@@ -97,10 +100,11 @@ pub async fn run(open: bool) -> Result<()> {
 /// in the same browser can't, and neither can a DNS-rebinding trick.
 async fn local_only(req: Request, next: Next) -> Response {
     let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-    let host_ok = [format!("127.0.0.1:{PORT}"), format!("localhost:{PORT}")].iter().any(|h| h == host);
+    let port = port();
+    let host_ok = [format!("127.0.0.1:{port}"), format!("localhost:{port}")].iter().any(|h| h == host);
     let origin_ok = match req.headers().get(header::ORIGIN).and_then(|h| h.to_str().ok()) {
         None => true,
-        Some(o) => o == format!("http://127.0.0.1:{PORT}") || o == format!("http://localhost:{PORT}"),
+        Some(o) => o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}"),
     };
     if !host_ok || !origin_ok {
         return (StatusCode::FORBIDDEN, "Slipmat only answers pages it served itself.").into_response();
@@ -138,6 +142,15 @@ async fn playlists(State(app): State<Shared>) -> Answer<Json<Value>> {
 async fn playlist(State(app): State<Shared>, Path(id): Path<String>) -> Answer<Json<Value>> {
     let (title, rows) = app.playlist(&id).await?;
     Ok(Json(json!({ "title": title, "rows": rows })))
+}
+
+async fn history(State(app): State<Shared>) -> Json<Value> {
+    Json(json!({ "title": "History", "rows": app.history_rows() }))
+}
+
+async fn clear_history(State(app): State<Shared>) -> Json<Value> {
+    app.clear_history();
+    Json(json!({ "ok": true }))
 }
 
 #[derive(Deserialize)]
@@ -241,6 +254,13 @@ async fn devices() -> Json<Value> {
     Json(json!({ "devices": list }))
 }
 
+/// Open the sound card afresh: finds the controller if it was plugged in late.
+async fn reconnect(State(app): State<Shared>) -> Answer<Json<Value>> {
+    let app2 = app.clone();
+    let status = tokio::task::spawn_blocking(move || app2.output.reconnect()).await.map_err(|e| anyhow!(e))??;
+    Ok(Json(json!({ "ok": true, "output": status })))
+}
+
 async fn autodj_status(State(app): State<Shared>) -> Json<crate::autodj::Status> {
     Json(app.autodj.status())
 }
@@ -306,6 +326,8 @@ async fn session(app: Shared, mut socket: WebSocket) {
                         "output": app.output.status(),
                         "midi": app.midi.lock().unwrap().clone(),
                         "batch": app.batch.lock().unwrap().clone(),
+                        "sampler": app.sampler_names,
+                        "played": app.played.lock().unwrap().clone(),
                     });
                 }
                 slow += 1;
@@ -347,6 +369,10 @@ async fn handle(app: &Shared, text: &str) {
             "load" => {
                 let d = v.get("d").and_then(|d| d.as_u64()).unwrap_or(0) as usize;
                 let uri = v.get("uri").and_then(|u| u.as_str()).unwrap_or("").to_string();
+                // The first of two LOAD presses (an instant double).
+                if app.doubled_recently(d) {
+                    return;
+                }
                 let app = app.clone();
                 tokio::spawn(async move {
                     if let Err(e) = app.load(d, &uri).await {
@@ -354,6 +380,8 @@ async fn handle(app: &Shared, text: &str) {
                     }
                 });
             }
+            "double" => app.double(v.get("d").and_then(|d| d.as_u64()).unwrap_or(0) as usize),
+            "key_sync" => app.key_sync(v.get("d").and_then(|d| d.as_u64()).unwrap_or(0) as usize),
             _ => {}
         }
         return;

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput, MidiOutputConnection};
 
-use crate::app::{App, Event};
-use crate::engine::fx::{ALL as FX_ALL, BEATS, FxKind};
-use crate::engine::{Control, DECKS, State};
+use crate::app::{Action, App, Event};
+use crate::engine::fx::{ALL as FX_ALL, BEATS, FxKind, MASTER};
+use crate::engine::{CFX_ALL, Control, DECKS, State};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PadMode {
@@ -64,6 +64,12 @@ fn stem_pad(now: [f32; 4], n: usize, shift: bool) -> [f32; 4] {
     g
 }
 
+/// KEY SHIFT pads (SHIFT + SAMPLER). Top row: straight to a shift of this
+/// many semitones (SHIFT: the bigger steps). Bottom row: match the other
+/// deck's key, a semitone down, a semitone up, back to the song's own key.
+const KEY_PADS: [i8; 4] = [-2, -1, 1, 2];
+const KEY_PADS_SHIFT: [i8; 4] = [-12, -7, 7, 12];
+
 const LOOP_BEATS: [f64; 8] = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const JUMP_BEATS: [f64; 8] = [-1.0, 1.0, -2.0, 2.0, -4.0, 4.0, -8.0, 8.0];
 const RANGES: [f32; 4] = [0.06, 0.10, 0.16, 0.50];
@@ -95,7 +101,12 @@ const PAD_UNIT: usize = 1;
 enum Out {
     Ctl(Control),
     Ev(Event),
+    /// Something the app does (it needs to know what's on the decks).
+    Act(Action),
 }
+
+/// Two presses of LOAD this close together ask for an instant double.
+const DOUBLE_PRESS: Duration = Duration::from_millis(450);
 
 pub struct Mapper {
     msb: HashMap<(u8, u8), u8>,
@@ -105,6 +116,12 @@ pub struct Mapper {
     fx_lever: [bool; 2],
     /// Pads held down in a PAD FX mode, and the unit settings to restore.
     pad_fx: Option<(usize, u8, crate::engine::FxState)>,
+    /// Where each knob and fader last said it was. The controller reports
+    /// every position again whenever it is asked (and it is asked five times
+    /// a second, to keep it awake); a position that hasn't moved must not
+    /// undo a change made on screen or by Auto-DJ.
+    last_hw: HashMap<(u8, u8), u16>,
+    last_load: [Option<Instant>; DECKS],
     pub vinyl: bool,
     pub invert_tempo: bool,
 }
@@ -117,6 +134,8 @@ impl Default for Mapper {
             last_tempo: [None; DECKS],
             fx_lever: [true, false],
             pad_fx: None,
+            last_hw: HashMap::new(),
+            last_load: [None; DECKS],
             vinyl: true,
             invert_tempo: false,
         }
@@ -135,8 +154,19 @@ impl Mapper {
             None
         } else {
             let msb = *self.msb.get(&(status, cc - 0x20))?;
-            Some(((msb as u32) << 7 | v as u32) as f32 / 16383.0)
+            let raw = (msb as u16) << 7 | v as u16;
+            if self.last_hw.insert((status, cc - 0x20), raw) == Some(raw) {
+                return None;
+            }
+            Some(raw as f32 / 16383.0)
         }
+    }
+
+    /// A controller was just plugged in: take every position it reports.
+    pub fn forget_positions(&mut self) {
+        self.msb.clear();
+        self.last_hw.clear();
+        self.last_tempo = [None; DECKS];
     }
 
     fn handle(&mut self, msg: &[u8], st: &State) -> Vec<Out> {
@@ -171,6 +201,12 @@ impl Mapper {
                     }
                     0x67 if !down => out.push(c(Control::JogTouch { d, on: false })),
                     0x58 if down => out.push(c(Control::Sync { d, on: None })),
+                    // BEAT SYNC held: sync on, whatever it was.
+                    0x5C if down => out.push(c(Control::Sync { d, on: Some(true) })),
+                    // Fader start (SHIFT + channel fader or crossfader): up
+                    // from the bottom plays, back down returns to the cue.
+                    0x66 if down => out.push(c(Control::Play { d })),
+                    0x52 if down => out.push(c(Control::BackCue { d })),
                     0x60 if down => {
                         let now = deck.map_or(0.08, |s| s.range);
                         let i = RANGES.iter().position(|r| (r - now).abs() < 0.001).map_or(0, |i| (i + 1) % RANGES.len());
@@ -188,18 +224,34 @@ impl Mapper {
                     0x50 if down => out.push(c(Control::Reloop { d })),
                     0x4C if down => out.push(c(Control::LoopHalve { d })),
                     0x4E if down => out.push(c(Control::LoopDouble { d })),
+                    // CUE/LOOP CALL: in a loop, halve or double it; else step
+                    // through the song's memory cues; a song with none
+                    // jumps four beats instead.
                     0x51 | 0x53 if down => {
                         let looping = deck.and_then(|s| s.lp).is_some_and(|l| l.active);
+                        let saved = deck.is_some_and(|s| s.memory.iter().any(|m| m.is_some()));
                         let back = data == 0x51;
-                        out.push(c(match (looping, back) {
-                            (true, true) => Control::LoopHalve { d },
-                            (true, false) => Control::LoopDouble { d },
-                            (false, true) => Control::BeatJump { d, beats: -4.0 },
-                            (false, false) => Control::BeatJump { d, beats: 4.0 },
+                        out.push(c(match (looping, saved, back) {
+                            (true, _, true) => Control::LoopHalve { d },
+                            (true, _, false) => Control::LoopDouble { d },
+                            (false, true, _) => Control::MemCall { d, dir: if back { -1 } else { 1 } },
+                            (false, false, true) => Control::BeatJump { d, beats: -4.0 },
+                            (false, false, false) => Control::BeatJump { d, beats: 4.0 },
                         }));
                     }
-                    0x3E if down => out.push(c(Control::BeatJump { d, beats: -16.0 })),
-                    0x3D if down => out.push(c(Control::BeatJump { d, beats: 16.0 })),
+                    // SHIFT + CUE/LOOP CALL: ◀ deletes a memory cue, ▶ saves one.
+                    0x3E if down => {
+                        if deck.is_some_and(|s| s.memory.iter().any(|m| m.is_some())) {
+                            out.push(c(Control::MemDelete { d }));
+                            out.push(Out::Ev(Event::Notice { text: format!("Deck {}: memory cue deleted", d + 1), error: false }));
+                        }
+                    }
+                    0x3D if down => {
+                        if deck.is_some_and(|s| s.loaded) {
+                            out.push(c(Control::MemStore { d }));
+                            out.push(Out::Ev(Event::Notice { text: format!("Deck {}: memory cue saved", d + 1), error: false }));
+                        }
+                    }
                     0x54 if down => out.push(c(Control::Pfl { d, on: !deck.is_some_and(|s| s.pfl) })),
                     0x68 if down => out.push(c(Control::KeyLock { d, on: !deck.is_some_and(|s| s.keylock) })),
                     n if down => {
@@ -266,9 +318,43 @@ impl Mapper {
             (0x90, 6) if down => match data {
                 0x41 => out.push(Out::Ev(Event::BrowsePress { shift: false })),
                 0x42 => out.push(Out::Ev(Event::BrowsePress { shift: true })),
-                0x46 => out.push(Out::Ev(Event::LoadSelected { d: 0 })),
-                0x47 => out.push(Out::Ev(Event::LoadSelected { d: 1 })),
+                0x46 | 0x47 => {
+                    let d = (data - 0x46) as usize;
+                    let now = Instant::now();
+                    // Pressed twice: the other deck's song, at the same place.
+                    if self.last_load[d].take().is_some_and(|at| now.duration_since(at) < DOUBLE_PRESS) {
+                        out.push(Out::Act(Action::Double { d }));
+                    } else {
+                        self.last_load[d] = Some(now);
+                        out.push(Out::Ev(Event::LoadSelected { d }));
+                    }
+                }
+                // SHIFT + LOAD: sort the list by BPM (deck 1) or key (deck 2).
+                0x68 => out.push(Out::Ev(Event::Sort { by: "bpm" })),
+                0x7A => out.push(Out::Ev(Event::Sort { by: "key" })),
                 0x63 => out.push(c(Control::MasterCue { on: !st.master_cue })),
+                0x78 => {
+                    out.push(c(Control::Quantize { on: !st.quantize }));
+                    out.push(Out::Ev(Event::Notice { text: format!("Quantize {}", if st.quantize { "off" } else { "on" }), error: false }));
+                }
+                0x00 => {
+                    out.push(c(Control::SmartCfx { on: !st.smart_cfx }));
+                    let text = if st.smart_cfx { "Smart CFX off: the knobs are plain filters".to_string() } else { format!("Smart CFX: filter + {}", st.cfx.name()) };
+                    out.push(Out::Ev(Event::Notice { text, error: false }));
+                }
+                0x08 => {
+                    let i = CFX_ALL.iter().position(|k| *k == st.cfx).unwrap_or(0);
+                    let next = CFX_ALL[(i + 1) % CFX_ALL.len()];
+                    out.push(c(Control::CfxKind { kind: next }));
+                    out.push(c(Control::SmartCfx { on: true }));
+                    out.push(Out::Ev(Event::Notice { text: format!("Smart CFX: filter + {}", next.name()), error: false }));
+                }
+                0x01 => {
+                    out.push(c(Control::SmartFader { on: !st.smart_fader }));
+                    let text = if st.smart_fader { "Smart Fader off" } else { "Smart Fader: the faders blend tempo and bass too" };
+                    out.push(Out::Ev(Event::Notice { text: text.into(), error: false }));
+                }
+                0x09 => out.push(Out::Act(Action::AutoDjToggle)),
                 _ => {}
             },
             // ---- beat FX -------------------------------------------------------
@@ -284,6 +370,13 @@ impl Mapper {
                     }
                     0x4A if down => out.push(c(Control::FxBeats { u: 0, i: fx.beats.saturating_sub(1) })),
                     0x4B if down => out.push(c(Control::FxBeats { u: 0, i: (fx.beats + 1).min(BEATS.len() - 1) })),
+                    // SHIFT + BEAT ◀: straight back to one beat.
+                    0x66 if down => out.push(c(Control::FxBeats { u: 0, i: 4 })),
+                    // SHIFT + BEAT ▶: the effect on the master instead.
+                    0x6B if down => {
+                        out.push(c(Control::FxAssign { u: 0, mask: fx.assign ^ MASTER }));
+                        out.push(Out::Ev(Event::Notice { text: format!("Beat FX on the master: {}", if fx.assign & MASTER == 0 { "on" } else { "off" }), error: false }));
+                    }
                     // The CH SELECT lever (CH1 / CH2 / CH1&CH2) reports each
                     // side as on or off; the unit follows the lever.
                     0x10 | 0x11 => {
@@ -328,12 +421,34 @@ impl Mapper {
                         }
                     }
                     0x00 => out.push(c(Control::Hotcue { d, n, down })),
+                    // BEAT LOOP pads; with SHIFT a loop roll (held, then the
+                    // song carries on where it would have been).
+                    0x60 if down && shift => out.push(c(Control::LoopRoll { d, beats: LOOP_BEATS[n], down: true })),
                     0x60 if down => out.push(c(Control::AutoLoop { d, beats: LOOP_BEATS[n] })),
+                    0x60 => {
+                        if st.decks.get(d).is_some_and(|s| s.rolling) {
+                            out.push(c(Control::LoopRoll { d, beats: LOOP_BEATS[n], down: false }));
+                        }
+                    }
+                    // SAMPLER pads: deck 1's play sounds 1-8, deck 2's 9-16
+                    // (SHIFT stops one).
+                    0x30 if down => out.push(c(if shift { Control::SampleStop { n: d * 8 + n } } else { Control::Sample { n: d * 8 + n } })),
+                    0x70 if down => {
+                        let now = st.decks.get(d).map_or(0, |s| s.key_shift);
+                        match n {
+                            0..=3 => out.push(c(Control::KeyShift { d, semitones: if shift { KEY_PADS_SHIFT[n] } else { KEY_PADS[n] } })),
+                            4 => out.push(Out::Act(Action::KeySync { d })),
+                            5 => out.push(c(Control::KeyShift { d, semitones: now - 1 })),
+                            6 => out.push(c(Control::KeyShift { d, semitones: now + 1 })),
+                            _ => out.push(c(Control::KeyShift { d, semitones: 0 })),
+                        }
+                    }
                     0x40 if down => {
                         let now = st.decks.get(d).map_or([1.0; 4], |s| s.stems);
                         out.push(c(Control::Stems { d, gains: stem_pad(now, n, shift) }));
                     }
-                    0x20 if down && !shift => out.push(c(Control::BeatJump { d, beats: JUMP_BEATS[n] })),
+                    // BEAT JUMP pads; SHIFT jumps sixteen times as far.
+                    0x20 if down => out.push(c(Control::BeatJump { d, beats: JUMP_BEATS[n] * if shift { 16.0 } else { 1.0 } })),
                     0x10 | 0x50 => {
                         let (kind, beats) = if base == 0x10 { PAD_FX1[n] } else { PAD_FX2[n] };
                         if down {
@@ -370,14 +485,21 @@ impl Mapper {
         let on = |b: bool| if b { 0x7F } else { 0x00 };
         for (d, s) in st.decks.iter().enumerate().take(DECKS) {
             let n = 0x90 | d as u8;
-            l.insert((n, 0x0B), on(s.playing || (s.loaded && !s.playing && blink)));
-            l.insert((n, 0x0C), on(s.loaded && (s.at_cue || (!s.playing && blink))));
-            l.insert((n, 0x58), on(s.sync));
-            l.insert((n, 0x54), on(s.pfl));
             let looping = s.lp.is_some_and(|lp| lp.active);
-            l.insert((n, 0x10), on(looping || s.loop_in.is_some() && blink));
-            l.insert((n, 0x11), on(looping));
-            l.insert((n, 0x4D), on(looping || s.lp.is_some() && blink));
+            // Each button's light is addressed twice: as itself, and as the
+            // button it becomes while SHIFT is held, so it doesn't go dark.
+            for (plain, shifted, lit) in [
+                (0x0B, 0x0E, s.playing || (s.loaded && !s.playing && blink)),
+                (0x0C, 0x48, s.loaded && (s.at_cue || (!s.playing && blink))),
+                (0x58, 0x60, s.sync),
+                (0x54, 0x68, s.pfl),
+                (0x10, 0x4C, looping || s.loop_in.is_some() && blink),
+                (0x11, 0x4E, looping),
+                (0x4D, 0x50, looping || s.lp.is_some() && blink),
+            ] {
+                l.insert((n, plain), on(lit));
+                l.insert((n, shifted), on(lit));
+            }
             for m in ALL_MODES {
                 l.insert((n, m.button()), on(self.pad_mode[d] == m));
             }
@@ -394,6 +516,20 @@ impl Mapper {
                     l.insert((pads, 0x20 + i), on(s.loaded));
                     let stem_lit = if i < 4 { s.stems[i as usize] > 0.5 } else { s.stems == STEM_PRESETS[i as usize - 4] };
                     l.insert((pads, 0x40 + i), on(s.loaded && stem_lit));
+                    // Sampler: lit when there's a sound on the pad, flashing while it plays.
+                    let slot = d * 8 + i as usize;
+                    l.insert((pads, 0x30 + i), on(st.sampler_loaded[slot] && !(st.sampler_playing[slot] && blink)));
+                    // Key shift: the top row shows which preset is on, the
+                    // bottom row which way the key has moved.
+                    let k = s.key_shift;
+                    let key_lit = match i {
+                        0..=3 => k == if shift == 1 { KEY_PADS_SHIFT[i as usize] } else { KEY_PADS[i as usize] },
+                        4 => s.loaded,
+                        5 => k < 0,
+                        6 => k > 0,
+                        _ => k != 0,
+                    };
+                    l.insert((pads, 0x70 + i), on(s.loaded && key_lit));
                     let held = |base: u8| self.pad_fx.as_ref().is_some_and(|p| p.0 == d && p.1 == base + i);
                     l.insert((pads, 0x10 + i), on(held(0x10)));
                     l.insert((pads, 0x50 + i), on(held(0x50)));
@@ -410,6 +546,8 @@ impl Mapper {
         if let Some(fx) = st.fx.first() {
             l.insert((0x94, 0x47), on(fx.on));
         }
+        l.insert((0x96, 0x00), on(st.smart_cfx));
+        l.insert((0x96, 0x01), on(st.smart_fader));
         l
     }
 }
@@ -430,10 +568,7 @@ fn meter_value(db: f32) -> u8 {
     127
 }
 
-fn is_controller(name: &str) -> bool {
-    let n = name.to_lowercase();
-    n.contains("ddj") || n.contains("pioneer")
-}
+use crate::engine::output::is_controller;
 
 struct Connected {
     name: String,
@@ -477,6 +612,7 @@ fn connect(app: &Arc<App>, mapper: &Arc<Mutex<Mapper>>) -> Option<Connected> {
                         Out::Ev(e) => {
                             let _ = cb_app.events.send(e);
                         }
+                        Out::Act(a) => cb_app.act(a),
                     }
                 }
             },
@@ -498,6 +634,7 @@ fn run(app: Arc<App>, mapper: Arc<Mutex<Mapper>>) {
     let mut conn: Option<Connected> = None;
     let mut last_scan = Instant::now() - Duration::from_secs(10);
     let mut last_keepalive = Instant::now();
+    let mut card_checks = 0u8;
     let started = Instant::now();
     let mut keys = [0usize; DECKS];
     let mut flash_until = [Instant::now(); DECKS];
@@ -518,12 +655,35 @@ fn run(app: Arc<App>, mapper: Arc<Mutex<Mapper>>) {
                     log::info!("controller disconnected: {}", c.name);
                     app.notice("Controller disconnected", true);
                     conn = None;
+                    // Its sound card went with it: move to what's left.
+                    app.output.refresh();
+                    card_checks = 0;
                 }
             }
             if conn.is_none() {
                 app.midi.lock().unwrap().ports = present.clone();
                 if present.iter().any(|n| is_controller(n)) {
                     conn = connect(&app, &mapper);
+                    if conn.is_some() {
+                        mapper.lock().unwrap().forget_positions();
+                        card_checks = 4;
+                    }
+                }
+            }
+            // The controller is also the sound card: move the music onto it
+            // (master on its outputs, the cue in its headphone jack). The
+            // card can show up a moment after the MIDI port, so look again
+            // a few times until the headphones are routed.
+            if card_checks > 0 {
+                card_checks -= 1;
+                let routed = app.output.status().headphones;
+                if !routed || card_checks == 3 {
+                    app.output.refresh();
+                } else {
+                    card_checks = 0;
+                }
+                if card_checks == 0 && conn.is_some() && !app.output.status().headphones {
+                    app.notice("The controller's headphone output isn't routed, so CUE can't be heard separately. Open Settings → Sound.", true);
                 }
             }
             app.midi.lock().unwrap().connected = conn.as_ref().map(|c| c.name.split(':').next().unwrap_or(&c.name).to_string());
@@ -577,6 +737,7 @@ mod tests {
         m.handle(msg, st).into_iter().map(|o| match o {
             Out::Ctl(c) => format!("{c:?}"),
             Out::Ev(e) => format!("{e:?}"),
+            Out::Act(a) => format!("{a:?}"),
         }).collect()
     }
 
@@ -657,5 +818,113 @@ mod tests {
         let up = ctl(&mut m, &[0x97, 0x11, 0x00], &st);
         assert!(up.iter().any(|s| s.contains("FxOn { u: 1, on: false }")));
         assert!(!up.iter().any(|s| s.contains("on: true")));
+    }
+
+    #[test]
+    fn the_rest_of_the_board() {
+        let mut m = Mapper::default();
+        let mut st = state();
+        st.decks[0].loaded = true;
+        // Sampler pads: deck 1 plays sounds 1-8, deck 2 sounds 9-16; SHIFT stops.
+        assert_eq!(ctl(&mut m, &[0x97, 0x32, 0x7F], &st), ["Sample { n: 2 }"]);
+        assert_eq!(ctl(&mut m, &[0x99, 0x30, 0x7F], &st), ["Sample { n: 8 }"]);
+        assert_eq!(ctl(&mut m, &[0x98, 0x32, 0x7F], &st), ["SampleStop { n: 2 }"]);
+        // Key shift pads.
+        assert_eq!(ctl(&mut m, &[0x97, 0x73, 0x7F], &st), ["KeyShift { d: 0, semitones: 2 }"]);
+        assert_eq!(ctl(&mut m, &[0x98, 0x70, 0x7F], &st), ["KeyShift { d: 0, semitones: -12 }"]);
+        assert_eq!(ctl(&mut m, &[0x99, 0x74, 0x7F], &st), ["KeySync { d: 1 }"]);
+        st.decks[1].key_shift = 3;
+        assert_eq!(ctl(&mut m, &[0x99, 0x76, 0x7F], &st), ["KeyShift { d: 1, semitones: 4 }"]);
+        assert_eq!(ctl(&mut m, &[0x99, 0x77, 0x7F], &st), ["KeyShift { d: 1, semitones: 0 }"]);
+        // SHIFT + beat loop pad: a roll while held.
+        assert_eq!(ctl(&mut m, &[0x98, 0x62, 0x7F], &st), ["LoopRoll { d: 0, beats: 1.0, down: true }"]);
+        st.decks[0].rolling = true;
+        assert_eq!(ctl(&mut m, &[0x97, 0x62, 0x00], &st), ["LoopRoll { d: 0, beats: 1.0, down: false }"]);
+        st.decks[0].rolling = false;
+        assert!(ctl(&mut m, &[0x97, 0x62, 0x00], &st).is_empty());
+        // SHIFT + beat jump pad: sixteen times as far.
+        assert_eq!(ctl(&mut m, &[0x98, 0x21, 0x7F], &st), ["BeatJump { d: 0, beats: 16.0 }"]);
+        // Fader start, BEAT SYNC held.
+        assert_eq!(ctl(&mut m, &[0x91, 0x66, 0x7F], &st), ["Play { d: 1 }"]);
+        assert_eq!(ctl(&mut m, &[0x91, 0x52, 0x7F], &st), ["BackCue { d: 1 }"]);
+        assert_eq!(ctl(&mut m, &[0x90, 0x5C, 0x7F], &st), ["Sync { d: 0, on: Some(true) }"]);
+        // Smart buttons.
+        assert!(ctl(&mut m, &[0x96, 0x01, 0x7F], &st)[0].starts_with("SmartFader { on: true }"));
+        assert!(ctl(&mut m, &[0x96, 0x00, 0x7F], &st)[0].starts_with("SmartCfx { on: true }"));
+        assert!(ctl(&mut m, &[0x96, 0x08, 0x7F], &st)[0].starts_with("CfxKind { kind: Space }"));
+        assert_eq!(ctl(&mut m, &[0x96, 0x09, 0x7F], &st), ["AutoDjToggle"]);
+        assert!(ctl(&mut m, &[0x96, 0x78, 0x7F], &st)[0].starts_with("Quantize { on: true }"));
+        assert_eq!(ctl(&mut m, &[0x96, 0x68, 0x7F], &st), ["Sort { by: \"bpm\" }"]);
+        assert_eq!(ctl(&mut m, &[0x96, 0x7A, 0x7F], &st), ["Sort { by: \"key\" }"]);
+        assert!(ctl(&mut m, &[0x94, 0x6B, 0x7F], &st)[0].starts_with("FxAssign { u: 0, mask: 128 }"));
+    }
+
+    #[test]
+    fn cue_loop_call_uses_memory_cues_when_the_song_has_them() {
+        let mut m = Mapper::default();
+        let mut st = state();
+        st.decks[0].loaded = true;
+        assert_eq!(ctl(&mut m, &[0x90, 0x53, 0x7F], &st), ["BeatJump { d: 0, beats: 4.0 }"]);
+        assert!(ctl(&mut m, &[0x90, 0x3D, 0x7F], &st)[0].starts_with("MemStore { d: 0 }"));
+        assert!(ctl(&mut m, &[0x90, 0x3E, 0x7F], &st).is_empty(), "nothing to delete yet");
+        st.decks[0].memory[0] = Some(crate::engine::deck::Mem { pos: 1000.0, end: None });
+        assert_eq!(ctl(&mut m, &[0x90, 0x53, 0x7F], &st), ["MemCall { d: 0, dir: 1 }"]);
+        assert_eq!(ctl(&mut m, &[0x90, 0x51, 0x7F], &st), ["MemCall { d: 0, dir: -1 }"]);
+        assert!(ctl(&mut m, &[0x90, 0x3E, 0x7F], &st)[0].starts_with("MemDelete { d: 0 }"));
+        // In a loop the same buttons resize it.
+        st.decks[0].lp = Some(crate::engine::deck::Loop { start: 0.0, end: 1000.0, active: true });
+        assert_eq!(ctl(&mut m, &[0x90, 0x51, 0x7F], &st), ["LoopHalve { d: 0 }"]);
+    }
+
+    #[test]
+    fn load_twice_is_an_instant_double() {
+        let mut m = Mapper::default();
+        let st = state();
+        assert_eq!(ctl(&mut m, &[0x96, 0x46, 0x7F], &st), ["LoadSelected { d: 0 }"]);
+        assert!(ctl(&mut m, &[0x96, 0x46, 0x00], &st).is_empty());
+        assert_eq!(ctl(&mut m, &[0x96, 0x46, 0x7F], &st), ["Double { d: 0 }"]);
+        // A third press starts over, and the other deck's button is separate.
+        assert_eq!(ctl(&mut m, &[0x96, 0x46, 0x7F], &st), ["LoadSelected { d: 0 }"]);
+        assert_eq!(ctl(&mut m, &[0x96, 0x47, 0x7F], &st), ["LoadSelected { d: 1 }"]);
+    }
+
+    #[test]
+    fn a_position_reported_again_changes_nothing() {
+        let mut m = Mapper::default();
+        let st = state();
+        ctl(&mut m, &[0xB1, 0x13, 0x10], &st);
+        assert_eq!(ctl(&mut m, &[0xB1, 0x33, 0x00], &st).len(), 1);
+        // The controller repeats where the fader is (it does whenever asked):
+        // nothing is sent, so a fader moved on screen stays where it was put.
+        ctl(&mut m, &[0xB1, 0x13, 0x10], &st);
+        assert!(ctl(&mut m, &[0xB1, 0x33, 0x00], &st).is_empty());
+        // Moving it is heard; so is everything after a re-plug.
+        ctl(&mut m, &[0xB1, 0x13, 0x11], &st);
+        assert_eq!(ctl(&mut m, &[0xB1, 0x33, 0x00], &st).len(), 1);
+        m.forget_positions();
+        ctl(&mut m, &[0xB1, 0x13, 0x11], &st);
+        assert_eq!(ctl(&mut m, &[0xB1, 0x33, 0x00], &st).len(), 1);
+    }
+
+    #[test]
+    fn lights_for_the_new_controls() {
+        let m = Mapper::default();
+        let mut st = state();
+        st.decks[0].loaded = true;
+        st.decks[0].playing = true;
+        st.decks[0].key_shift = -1;
+        st.smart_fader = true;
+        st.sampler_loaded[3] = true;
+        st.sampler_playing[3] = true;
+        let l = m.lights(&st, true, &[false; DECKS]);
+        assert_eq!(l[&(0x96, 0x01)], 0x7F);
+        assert_eq!(l[&(0x96, 0x00)], 0x00);
+        // PLAY's light is kept while SHIFT is held too.
+        assert_eq!((l[&(0x90, 0x0B)], l[&(0x90, 0x0E)]), (0x7F, 0x7F));
+        // Key shift: -1 preset lit, "down" lit, "up" dark, reset lit.
+        assert_eq!((l[&(0x97, 0x71)], l[&(0x97, 0x75)], l[&(0x97, 0x76)], l[&(0x97, 0x77)]), (0x7F, 0x7F, 0x00, 0x7F));
+        // A playing sample flashes: dark on the blink, lit off it.
+        assert_eq!(l[&(0x97, 0x33)], 0x00);
+        assert_eq!(m.lights(&st, false, &[false; DECKS])[&(0x97, 0x33)], 0x7F);
     }
 }

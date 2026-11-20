@@ -78,7 +78,8 @@ pub fn load(session: &Session, uri: &str, duration_ms: u32) -> Result<Arc<TrackA
             if len != last_len {
                 last_len = len;
                 last_progress = Instant::now();
-            } else if last_progress.elapsed() > Duration::from_secs(30) {
+            } else if last_progress.elapsed() > Duration::from_secs(if len == 0 { 12 } else { 30 }) {
+                // (One that never starts is given up on sooner: it's retried.)
                 log::warn!("{uri} stalled at {len} frames");
                 watch.failed.store(len == 0, Ordering::Release);
                 watch.done.store(len > 0, Ordering::Release);
