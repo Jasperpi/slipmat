@@ -105,6 +105,10 @@ enum Out {
     Act(Action),
 }
 
+/// Lights changed, and lights repeated, per 40 ms.
+const LIGHTS_PER_TICK: usize = 40;
+const LIGHTS_REPEATED: usize = 4;
+
 /// Two presses of LOAD this close together ask for an instant double.
 const DOUBLE_PRESS: Duration = Duration::from_millis(450);
 
@@ -634,7 +638,9 @@ fn run(app: Arc<App>, mapper: Arc<Mutex<Mapper>>) {
     let mut conn: Option<Connected> = None;
     let mut last_scan = Instant::now() - Duration::from_secs(10);
     let mut last_keepalive = Instant::now();
+    let mut heal = 0usize;
     let mut card_checks = 0u8;
+    let mut gone_checks = 0u8;
     let started = Instant::now();
     let mut keys = [0usize; DECKS];
     let mut flash_until = [Instant::now(); DECKS];
@@ -655,10 +661,15 @@ fn run(app: Arc<App>, mapper: Arc<Mutex<Mapper>>) {
                     log::info!("controller disconnected: {}", c.name);
                     app.notice("Controller disconnected", true);
                     conn = None;
-                    // Its sound card went with it: move to what's left.
+                    // Its sound card went with it: move to what's left (and
+                    // look once more, in case the card took longer to go).
                     app.output.refresh();
                     card_checks = 0;
+                    gone_checks = 1;
                 }
+            } else if gone_checks > 0 {
+                gone_checks -= 1;
+                app.output.refresh();
             }
             if conn.is_none() {
                 app.midi.lock().unwrap().ports = present.clone();
@@ -707,12 +718,38 @@ fn run(app: Arc<App>, mapper: Arc<Mutex<Mapper>>) {
         let want = mapper.lock().unwrap().lights(&st, blink, &flash);
         // Forget lights no longer asked for, so they're sent again next time.
         c.sent.retain(|k, _| want.contains_key(k));
-        for (k, v) in want {
-            if c.sent.get(&k) != Some(&v) {
-                let kind = k.0 & 0xF0;
-                let ok = if kind == 0x90 || kind == 0xB0 { out.send(&[k.0, k.1, v]).is_ok() } else { true };
-                if ok {
-                    c.sent.insert(k, v);
+        // In a fixed order, and only so many at a time: a burst of hundreds
+        // (every light, when the controller is first plugged in) overruns
+        // the MIDI buffer and the ones that fall off would stay wrong.
+        let mut keys: Vec<(u8, u8)> = want.keys().copied().collect();
+        keys.sort_unstable();
+        let mut budget = LIGHTS_PER_TICK;
+        fn light(sent: &mut HashMap<(u8, u8), u8>, out: &mut MidiOutputConnection, k: (u8, u8), v: u8) {
+            let kind = k.0 & 0xF0;
+            if kind != 0x90 && kind != 0xB0 || out.send(&[k.0, k.1, v]).is_ok() {
+                sent.insert(k, v);
+            }
+        }
+        let sent = &mut c.sent;
+        for &k in &keys {
+            let v = want[&k];
+            if sent.get(&k) != Some(&v) {
+                if budget == 0 {
+                    break;
+                }
+                budget -= 1;
+                light(sent, out, k, v);
+            }
+        }
+        // And a few are said again each time round, so a light that was
+        // missed anyway comes right within a couple of seconds.
+        if budget > 0 && !keys.is_empty() {
+            for _ in 0..LIGHTS_REPEATED {
+                heal = (heal + 1) % keys.len();
+                let k = keys[heal];
+                // (Not the meters or the "loaded" flash: those are events.)
+                if k.0 & 0xF0 == 0x90 && k.0 != 0x9F {
+                    light(sent, out, k, want[&k]);
                 }
             }
         }

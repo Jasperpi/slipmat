@@ -111,7 +111,7 @@ export class Library {
     }
     const token = (this.token = Symbol());
     try {
-      const url = src === 'liked' ? '/api/liked' : src === 'search' ? `/api/search?q=${encodeURIComponent(id)}` : `/api/playlist/${encodeURIComponent(id)}`;
+      const url = src === 'liked' ? '/api/liked' : src === 'history' ? '/api/history' : src === 'search' ? `/api/search?q=${encodeURIComponent(id)}` : `/api/playlist/${encodeURIComponent(id)}`;
       const data = await this.api.get(url);
       if (token !== this.token) return;
       this.title.textContent = data.title;
@@ -182,6 +182,7 @@ export class Library {
     const first = Math.max(0, Math.floor(top / ROW) - 6);
     const last = Math.min(this.view.length, Math.ceil((top + h) / ROW) + 6);
     const ctx = this.getContext();
+    const played = new Set(ctx.played || []);
     const sig = `${first}:${last}:${this.sel}:${this.view.length}:${ctx.sig}`;
     if (!force && sig === this.sig) return;
     this.sig = sig;
@@ -197,9 +198,11 @@ export class Library {
       const keyHtml = r.key == null ? '' : keyChip(r.key, ctx.lead?.key != null && !compatible(ctx.lead.key, r.key));
       const near = r.bpm && ctx.lead?.bpm && Math.abs(r.bpm / ctx.lead.bpm - 1) < 0.06 ? ' near' : '';
       const art = r.image ? ` style="background-image:url('${r.image}')"` : '';
-      html.push(`<div class="row${i === this.sel ? ' sel' : ''}${r.playable ? '' : ' dead'}${on}" style="position:absolute;left:0;right:0;top:${i * ROW}px" data-i="${i}" draggable="${r.playable}">
+      const was = this.source === 'history' ? '' : played.has(r.id) ? ' played' : '';
+      const when = this.source === 'history' && r.added_at ? `<small class="when">${clockTime(r.added_at)}</small> ` : '';
+      html.push(`<div class="row${i === this.sel ? ' sel' : ''}${r.playable ? '' : ' dead'}${on}${was}" style="position:absolute;left:0;right:0;top:${i * ROW}px" data-i="${i}" draggable="${r.playable}">
         <span class="c-art"${art}></span>
-        <span class="c-title" title="${esc(r.name)}">${esc(r.name)}${r.explicit ? ' <small style="color:var(--faint)">E</small>' : ''}</span>
+        <span class="c-title" title="${esc(r.name)}${was ? ' · played this session' : ''}">${when}${esc(r.name)}${r.explicit ? ' <small style="color:var(--faint)">E</small>' : ''}</span>
         <span class="c-artist">${esc(r.artist)}</span>
         <span class="c-bpm${near}">${r.bpm ? r.bpm.toFixed(1) : ''}</span>
         <span class="c-key">${keyHtml}</span>
@@ -252,6 +255,14 @@ export class Library {
     this.render(true);
   }
 
+  // SHIFT + LOAD on the controller: sort by a column (again: the other way, then off).
+  sortBy(key) {
+    this.sort = this.sort?.key === key ? (this.sort.dir === 1 ? { key, dir: -1 } : null) : { key, dir: 1 };
+    document.querySelectorAll('.row.head .sort').forEach((x) => x.classList.toggle('by', this.sort?.key === x.dataset.sort));
+    this.apply();
+    window.toast(this.sort ? `Sorted by ${key.toUpperCase()}${this.sort.dir < 0 ? ', highest first' : ''}` : 'Back to the list’s own order');
+  }
+
   // The browse knob's push: switch between the playlist list and the songs.
   press() {
     const list = [...document.querySelectorAll('#sources .source')];
@@ -278,6 +289,13 @@ export class Library {
 
 export function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+// When a song was played: the time today, the date before that.
+function clockTime(unix) {
+  const d = new Date(unix * 1000);
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.getMonth() + 1}/${d.getDate()} ${hm}`;
 }
 
 export function mmss(s) {

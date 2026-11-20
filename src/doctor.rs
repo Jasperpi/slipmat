@@ -56,7 +56,7 @@ pub async fn run(args: &[String]) -> Result<()> {
         return stems_file(f, model).await;
     }
     if args.iter().any(|a| a == "--fake-ddj") {
-        return fake_ddj();
+        return fake_ddj(value(args, "--name").unwrap_or("DDJ-FLX4 fake"), value(args, "--midi"));
     }
     if let Some(q) = value(args, "--attrs") {
         return attrs(q).await;
@@ -183,32 +183,53 @@ async fn load_one(session: &librespot_core::Session, q: &str) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn fake_ddj() -> Result<()> {
+fn fake_ddj(_name: &str, _script: Option<&str>) -> Result<()> {
     Err(anyhow!("--fake-ddj needs virtual MIDI ports, which only Linux and macOS have"))
 }
 
 /// Pretend to be a DDJ-FLX4 (virtual MIDI ports), for testing the mapping
 /// against a running Slipmat without the hardware.
 #[cfg(unix)]
-fn fake_ddj() -> Result<()> {
+fn fake_ddj(name: &str, script: Option<&str>) -> Result<()> {
     use midir::os::unix::{VirtualInput, VirtualOutput};
     use std::sync::{Arc, Mutex};
     let lights: Arc<Mutex<Vec<[u8; 3]>>> = Arc::default();
     let seen = lights.clone();
-    let _input = midir::MidiInput::new("fake-ddj")?
-        .create_virtual("DDJ-FLX4 fake", move |_, m, _| {
+    // A client name the installed Slipmat wouldn't take for a controller, when testing beside it.
+    let client = if name.to_lowercase().contains("ddj") { "fake-ddj" } else { "test-rig" };
+    let _input = midir::MidiInput::new(client)?
+        .create_virtual(name, move |_, m, _| {
             if m.len() == 3 {
                 seen.lock().unwrap().push([m[0], m[1], m[2]]);
             }
         }, ())
         .map_err(|e| anyhow!("{e}"))?;
-    let mut out = midir::MidiOutput::new("fake-ddj")?.create_virtual("DDJ-FLX4 fake").map_err(|e| anyhow!("{e}"))?;
-    println!("fake DDJ-FLX4 up; waiting for Slipmat to find it…");
+    let mut out = midir::MidiOutput::new(client)?.create_virtual(name).map_err(|e| anyhow!("{e}"))?;
+    println!("fake controller “{name}” up; waiting for Slipmat to find it…");
     std::thread::sleep(Duration::from_secs(5));
     let mut send = |m: &[u8]| {
         let _ = out.send(m);
         std::thread::sleep(Duration::from_millis(30));
     };
+    // `--midi "90 0B 7F, wait 500, show 90 0B"`: send those messages
+    // (hex), pause (milliseconds), and print lights as last set.
+    if let Some(script) = script {
+        for step in script.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(ms) = step.strip_prefix("wait ") {
+                std::thread::sleep(Duration::from_millis(ms.trim().parse().unwrap_or(0)));
+            } else if let Some(which) = step.strip_prefix("show ") {
+                let b: Vec<u8> = which.split_whitespace().filter_map(|h| u8::from_str_radix(h, 16).ok()).collect();
+                let got = lights.lock().unwrap();
+                let v = got.iter().rev().find(|m| b.len() == 2 && m[0] == b[0] && m[1] == b[1]).map(|m| m[2]);
+                println!("light {which}: {}", v.map_or("never set".to_string(), |v| format!("{v:02X}")));
+            } else {
+                let bytes: Vec<u8> = step.split_whitespace().filter_map(|h| u8::from_str_radix(h, 16).ok()).collect();
+                send(&bytes);
+            }
+        }
+        println!("{} light messages back from Slipmat", lights.lock().unwrap().len());
+        return Ok(());
+    }
     // Deck 1: fader full, crossfader centre, low EQ killed, play.
     send(&[0xB0, 0x13, 0x7F]);
     send(&[0xB0, 0x33, 0x7F]);

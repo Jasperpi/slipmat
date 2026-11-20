@@ -7,7 +7,8 @@ import { Library, esc } from './library.js';
 import { keyLabel, keyColor, useCamelot } from './keys.js';
 
 const FRAMES_PER_TICK = SRC * (60 / (100 / 3)) / 720;
-const FX_KINDS = ['echo', 'reverb', 'flanger', 'phaser', 'roll', 'trans', 'crush', 'wobble'];
+const FX_KINDS = [['echo', 'Echo'], ['low_cut_echo', 'Low Cut Echo'], ['ping_pong', 'Ping Pong'], ['spiral', 'Spiral'], ['reverb', 'Reverb'], ['flanger', 'Flanger'], ['phaser', 'Phaser'], ['roll', 'Roll'], ['trans', 'Trans'], ['crush', 'Crush'], ['wobble', 'Wobble']];
+const CFX_KINDS = [['echo', 'Dub Echo'], ['space', 'Space'], ['noise', 'Noise'], ['crush', 'Crush'], ['jet', 'Jet']];
 const FX_BEATS = ['1/8', '1/4', '1/2', '3/4', '1', '2', '4', '8', '16'];
 const LOOPS = [[0.25, '¼'], [0.5, '½'], [1, '1'], [2, '2'], [4, '4'], [8, '8'], [16, '16']];
 const JUMPS = [1, 2, 4, 8, 16, 32];
@@ -109,9 +110,9 @@ function buildDeck(d) {
           <div class="times"><span class="elapsed">0:00.0</span><span class="remain">-0:00.0</span></div>
           <div class="chips"><span class="chip key">—</span><span class="chip gain" title="Auto gain"></span><div class="beats"><i class="down"></i><i></i><i></i><i></i></div></div>
           <div class="stems"></div>
-          <div class="grid-tools"></div>
         </div>
       </div>
+      <div class="tools"><div class="grid-tools"></div><div class="key-tools"></div></div>
       <div class="transport"></div>
       <div class="pads"></div>
       <div class="loops"></div>
@@ -181,6 +182,32 @@ function buildDeck(d) {
   gridLabel.textContent = 'GRID';
   gridLabel.title = 'If the grid lines don’t sit on the kicks, fix them here';
   gt.prepend(gridLabel);
+
+  // Key shift, memory cues, instant double.
+  const kt = $('.key-tools', root);
+  const chip = (text, title) => { const c = document.createElement('span'); c.className = 'chip'; c.textContent = text; c.title = title; return c; };
+  const keyDown = btn('▾', 'Key down a semitone (tempo unchanged)', 'xs');
+  keyDown.onclick = () => ctl('key_shift', { d, semitones: (S.engine?.decks[d]?.key_shift ?? 0) - 1 });
+  ui.keyShift = btn('0', 'Key shift in semitones (click to go back to the song’s own key)', 'xs keyshift');
+  ui.keyShift.onclick = () => ctl('key_shift', { d, semitones: 0 });
+  const keyUp = btn('▴', 'Key up a semitone (tempo unchanged)', 'xs');
+  keyUp.onclick = () => ctl('key_shift', { d, semitones: (S.engine?.decks[d]?.key_shift ?? 0) + 1 });
+  const keySync = btn('MATCH', 'Key sync: shift this song the few semitones that make it fit the other deck', 'xs');
+  keySync.onclick = () => send({ t: 'key_sync', d });
+  const sepk = () => { const x = document.createElement('span'); x.className = 'sep'; return x; };
+  const memBack = btn('◀', 'Previous memory cue', 'xs');
+  memBack.onclick = () => ctl('mem_call', { d, dir: -1 });
+  const memFwd = btn('▶', 'Next memory cue', 'xs');
+  memFwd.onclick = () => ctl('mem_call', { d, dir: 1 });
+  const memSave = btn('＋', 'Save this spot (and its loop, if one is on) as a memory cue', 'xs');
+  memSave.onclick = () => ctl('mem_store', { d });
+  const memDel = btn('×', 'Delete the memory cue last called, or the one right here', 'xs');
+  memDel.onclick = () => ctl('mem_delete', { d });
+  ui.memCount = chip('MEM', 'Memory cues: spots saved in this song that CUE/LOOP CALL steps through');
+  const twin = btn('DBL', `Instant double: copy deck ${2 - d} here, same song, same spot (on the controller: press LOAD twice)`, 'xs');
+  twin.onclick = () => send({ t: 'double', d });
+  kt.append(keyDown, ui.keyShift, keyUp, keySync, sepk(), ui.memCount, memBack, memFwd, memSave, memDel);
+  gt.append(sepk(), twin);
 
   // Transport.
   const tr = $('.transport', root);
@@ -408,7 +435,20 @@ function buildMixer() {
   curveLabel.className = 'fx-name';
   curveLabel.textContent = 'CURVE';
   foot.append(curveLabel, m.curve);
-  root.append(xf, foot);
+  // Smart Fader and Smart CFX, as on the controller.
+  const smart = document.createElement('div');
+  smart.className = 'xf-foot smart';
+  m.smartFader = btn('SMART FADER', 'Smart Fader: moving between the decks also glides the tempo from one song’s to the other’s and swaps their basslines', 'xs');
+  m.smartFader.onclick = () => ctl('smart_fader', { on: !S.engine?.smart_fader });
+  m.smartCfx = btn('SMART CFX', 'Smart CFX: the FILTER knobs add an effect on top of the filter', 'xs');
+  m.smartCfx.onclick = () => ctl('smart_cfx', { on: !S.engine?.smart_cfx });
+  m.cfx = document.createElement('select');
+  m.cfx.className = 'curve';
+  m.cfx.title = 'What Smart CFX adds to the filter';
+  m.cfx.innerHTML = CFX_KINDS.map(([k, label]) => `<option value="${k}">${label}</option>`).join('');
+  m.cfx.onchange = () => ctl('cfx_kind', { kind: m.cfx.value });
+  smart.append(m.smartFader, m.smartCfx, m.cfx);
+  root.append(xf, foot, smart);
 
   // Two effect units, up in the top bar.
   const fxRow = $('#fxbar');
@@ -419,7 +459,7 @@ function buildMixer() {
     name.className = 'fx-name';
     name.textContent = `FX${u + 1}`;
     const sel = document.createElement('select');
-    sel.innerHTML = FX_KINDS.map((k) => `<option value="${k}">${k[0].toUpperCase() + k.slice(1)}</option>`).join('');
+    sel.innerHTML = FX_KINDS.map(([k, label]) => `<option value="${k}">${label}</option>`).join('');
     sel.onchange = () => ctl('fx_kind', { u, kind: sel.value });
     const less = btn('◀', 'Shorter', 'xs');
     const beats = document.createElement('span');
@@ -571,6 +611,16 @@ function drawLanes(t) {
         }
       };
       st.hotcues.forEach((c, n) => c != null && flag(c, CUE_COLORS[n], String(n + 1)));
+      // Memory cues: a notch at the bottom (a bracket for a saved loop).
+      for (const m of st.memory) {
+        if (!m) continue;
+        const x = px(m.pos);
+        if (x < -40 * dpr || x > W + 40 * dpr) continue;
+        ctx.fillStyle = '#e879f9';
+        ctx.fillRect(x - dpr, y0 + laneH - 16 * dpr, 2 * dpr, 16 * dpr);
+        ctx.fillRect(x, y0 + laneH - 16 * dpr, 7 * dpr, 4 * dpr);
+        if (m.end != null) ctx.fillRect(x, y0 + laneH - 3 * dpr, (m.end - m.pos) / span * W, 2 * dpr);
+      }
       ctx.fillStyle = '#ffffff';
       const cx = px(st.cue);
       ctx.beginPath();
@@ -635,6 +685,11 @@ function drawOverview(ui, t) {
     ctx.fillRect(cue / len * W - dpr / 2, 0, 1.5 * dpr, H);
     ctx.fillRect(cue / len * W - dpr / 2, 0, 5 * dpr, 5 * dpr);
   });
+  for (const m of st.memory) {
+    if (!m) continue;
+    ctx.fillStyle = '#e879f9';
+    ctx.fillRect(m.pos / len * W - dpr / 2, H - 7 * dpr, 2 * dpr, 7 * dpr);
+  }
   ctx.fillStyle = '#fff';
   ctx.fillRect(st.cue / len * W - dpr / 2, H - 5 * dpr, 4 * dpr, 5 * dpr);
   ctx.fillStyle = '#fff';
@@ -742,10 +797,14 @@ function onState(msg) {
     const pct = (st.tempo - 1) * 100;
     setText(ui.tempo, `${pct >= 0 ? '+' : '−'}${Math.abs(pct).toFixed(2)}%${st.keylock ? ' · key lock' : ''}`);
     cls(ui.tempo, 'synced', st.sync);
+    const shift = st.key_shift || 0;
     if (meta?.key != null) {
-      setText(ui.key, keyLabel(meta.key));
+      // The key as heard: the song's own, moved by the key shift.
+      const base = meta.key >= 12 ? 12 : 0;
+      const heard = base + ((meta.key - base + shift) % 12 + 12) % 12;
+      setText(ui.key, keyLabel(heard));
       ui.key.classList.add('key');
-      ui.key.style.background = keyColor(meta.key);
+      ui.key.style.background = keyColor(heard);
     } else {
       setText(ui.key, meta?.analysing ? 'key…' : '—');
       ui.key.classList.remove('key');
@@ -758,6 +817,10 @@ function onState(msg) {
       const opt = [...ui.range.options].reduce((a, o) => Math.abs(+o.value - st.range) < Math.abs(+a.value - st.range) ? o : a);
       if (ui.range.value !== opt.value) ui.range.value = opt.value;
     }
+    setText(ui.keyShift, shift ? `${shift > 0 ? '+' : '−'}${Math.abs(shift)}` : '0');
+    cls(ui.keyShift, 'on', shift !== 0);
+    const mems = st.memory.filter(Boolean).length;
+    setText(ui.memCount, mems ? `MEM ${mems}` : 'MEM');
     cls(ui.play, 'on', st.playing);
     cls(ui.play, 'blink', st.loaded && !st.playing);
     cls(ui.cue, 'on', st.loaded && st.at_cue);
@@ -793,6 +856,10 @@ function onState(msg) {
   mixer.headLevel.update(e.head_level);
   mixer.xf.update(e.crossfader);
   cls(mixer.quantize, 'on', e.quantize);
+  cls(mixer.smartFader, 'on', e.smart_fader);
+  cls(mixer.smartCfx, 'on', e.smart_cfx);
+  if (document.activeElement !== mixer.cfx) mixer.cfx.value = e.cfx;
+  sampler.update(e);
   cls(mixer.masterCue, 'on', e.master_cue);
   if (document.activeElement !== mixer.curve) mixer.curve.value = e.curve;
   e.fx.forEach((fx, u) => {
@@ -841,6 +908,12 @@ function pills() {
       po.title = `${out.device}: ${out.channels} channels, ${(out.rate / 1000).toFixed(1)} kHz, ~${out.latency_ms.toFixed(0)} ms.` + (out.headphones ? ' Master and headphones are routed.' : ' No separate headphone output: plug in the controller, or use split cue in Settings.');
     }
   }
+  // The controller is here but its headphone jack isn't getting the cue:
+  // say so loudly, because pre-listening silently won't work.
+  const noPhones = !!(x.midi?.connected && out && !out.silent && !out.headphones);
+  const warn = $('#phones-warning');
+  if (warn.hidden === noPhones) warn.hidden = !noPhones;
+  if (noPhones) setText($('#phones-warning-text'), `Headphone CUE has no output of its own: sound is going to “${out.device}” (${out.channels} channels), so a cued deck can’t be heard separately.`);
   const midi = x.midi;
   const pc = $('#pill-controller');
   if (midi) {
@@ -878,6 +951,7 @@ function onEvent(ev) {
     case 'browse_press': library.press(); break;
     case 'load_selected': load(ev.d, library.selected()); break;
     case 'analysed': library.updateAnalysis(ev.id, ev.bpm, ev.key); break;
+    case 'sort': library.sortBy(ev.by); break;
     case 'list_changed':
       if (ev.list === 'playlists') library.loadPlaylists();
       else if (ev.list === library.source) library.open(library.source, library.sourceId, true);
@@ -996,6 +1070,52 @@ function renderAutoDj() {
       </div>`).join('')
     : '<div class="adj-empty">Drag songs here, press <b>+</b> on a song,<br>or “Auto-DJ list” for a whole playlist.<br><br>Slipmat mixes each into the next:<br>in time, on the phrase, bass swapped.</div>';
 }
+
+// ---- sampler -----------------------------------------------------------------------------
+
+const sampler = {
+  pads: [],
+  build() {
+    const box = $('#sampler-pads');
+    for (let n = 0; n < 8; n++) {
+      const p = document.createElement('button');
+      p.className = 'spad';
+      p.addEventListener('pointerdown', (e) => {
+        if (e.button === 2 || e.shiftKey) return ctl('sample_stop', { n });
+        ctl('sample', { n });
+      });
+      p.addEventListener('contextmenu', (e) => e.preventDefault());
+      box.append(p);
+      this.pads.push(p);
+    }
+    this.volume = fader({ horizontal: true, title: 'Sampler volume', onChange: (v) => ctl('sampler_volume', { v }) });
+    $('#sampler-volume').append(this.volume.el);
+  },
+  update(e) {
+    const names = S.extras.sampler || [];
+    this.pads.forEach((p, n) => {
+      setText(p, names[n] || `Pad ${n + 1}`);
+      if (p._title !== names[n]) { p._title = names[n]; p.title = `${names[n] || 'Empty'} · click to play, right-click to stop · on the controller: SAMPLER pads`; }
+      cls(p, 'playing', e.sampler_playing?.[n]);
+      p.disabled = !e.sampler_loaded?.[n];
+    });
+    this.volume.update(e.sampler_volume ?? 0.8);
+  },
+};
+
+async function reconnectSound() {
+  try {
+    const r = await api.post('/api/output/reconnect');
+    S.extras.output = r.output;
+    outputStatus(r.output);
+    toast(r.output.headphones ? `Sound on ${r.output.device}: master and headphones routed` : `Sound on ${r.output.device || 'nothing'}: still no separate headphone output`, !r.output.headphones);
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+$('#phones-reconnect').onclick = reconnectSound;
+$('#set-reconnect').onclick = reconnectSound;
+$('#pill-output').onclick = reconnectSound;
 
 // ---- settings, login, help ----------------------------------------------------------
 
@@ -1218,13 +1338,15 @@ setInterval(() => {
 
 const decks = [buildDeck(0), buildDeck(1)];
 const mixer = buildMixer();
+sampler.build();
 const library = new Library({
   api,
   onLoad: load,
   onAdd: (rows) => addToAutoDj(rows),
   getContext: () => {
     const lead = leadDeck();
-    return { decks: S.decks.map((m) => m && { id: m.id }), lead, sig: `${S.decks.map((m) => m?.id).join()}|${lead?.key}|${lead?.bpm?.toFixed(1)}` };
+    const played = S.extras.played || [];
+    return { decks: S.decks.map((m) => m && { id: m.id }), lead, played, sig: `${S.decks.map((m) => m?.id).join()}|${lead?.key}|${lead?.bpm?.toFixed(1)}|${played.length}` };
   },
 });
 library.bind();

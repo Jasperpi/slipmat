@@ -30,6 +30,10 @@
 
 <section class="lanes" id="lanes">
   <canvas id="lane-canvas"></canvas>
+  <div class="phones-warning" id="phones-warning" hidden>
+    <span id="phones-warning-text"></span>
+    <button class="small" id="phones-reconnect">Reconnect sound</button>
+  </div>
   <div class="lane-zoom">
     <button id="zoom-out" title="Zoom out">−</button>
     <button id="zoom-in" title="Zoom in">+</button>
@@ -50,6 +54,7 @@
     </label>
     <nav id="sources">
       <button class="source active" data-src="liked">♥ Liked Songs</button>
+      <button class="source" data-src="history" title="Every song you've played to the room, newest first">◷ History</button>
       <div class="source-head">Playlists</div>
       <div id="playlists"><div class="hint">Sign in to see your playlists</div></div>
     </nav>
@@ -78,6 +83,10 @@
     </div>
   </div>
   <aside class="autodj" id="autodj">
+    <div class="sampler">
+      <div class="adj-head"><span class="adj-title">SAMPLER</span><div class="sampler-volume" id="sampler-volume"></div></div>
+      <div class="sampler-pads" id="sampler-pads"></div>
+    </div>
     <div class="adj-head">
       <span class="adj-title">AUTO-DJ</span>
       <button class="adj-toggle" id="adj-on" title="Let Slipmat mix the list by itself">OFF</button>
@@ -116,6 +125,7 @@
       <label>Headphones <select id="set-cue"><option value="2,3">Channels 3 – 4 (DDJ headphone jack)</option><option value="split">Split: cue left, master right</option><option value="none">None</option></select></label>
       <label>Buffer <select id="set-buffer"><option>128</option><option>256</option><option>512</option><option>1024</option></select></label>
       <p class="fine" id="set-output-status"></p>
+      <div><button class="small" id="set-reconnect" title="Look for the controller's sound card again">Reconnect sound</button></div>
       <h4>Decks</h4>
       <label class="check"><input type="checkbox" id="set-keylock"> Key lock on new songs (tempo changes keep the pitch)</label>
       <label class="check"><input type="checkbox" id="set-quantize"> Quantize (hot cues, loops and jumps land on the beat)</label>
@@ -147,10 +157,14 @@
     </div>
     <h4>On the controller</h4>
     <div class="help-grid">
-      <div>Browse knob scrolls the list (SHIFT: zoom), push switches playlists/songs, LOAD loads</div>
-      <div>4 BEAT/EXIT: a 4-beat loop or out of it · CUE/LOOP CALL ◀▶ halve/double · SHIFT + BEAT SYNC: tempo range</div>
-      <div>SHIFT + HOT CUE pads = stems: 1-4 on/off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all</div>
-      <div>PAD FX modes: hold a pad for roll, echo, trans… · SHIFT + headphone CUE: key lock · MASTER CUE: master in phones</div>
+      <div>Browse knob scrolls the list (SHIFT: zoom), push switches playlists/songs · LOAD loads, <b>LOAD twice</b> = instant double of the other deck · SHIFT + LOAD sorts by BPM (deck 1) or key (deck 2)</div>
+      <div>4 BEAT/EXIT: a 4-beat loop or out of it · CUE/LOOP CALL ◀▶: halve/double a loop, else step through memory cues (none saved: jump 4 beats) · SHIFT + ▶ saves a memory cue, SHIFT + ◀ deletes one</div>
+      <div>BEAT SYNC: sync on/off (hold: on) · SHIFT + BEAT SYNC: tempo range · SHIFT + a channel fader or the crossfader: fader start (up plays, back down returns to the cue)</div>
+      <div>SMART FADER: the faders blend tempo and bass too (SHIFT: Auto-DJ on/off) · SMART CFX: FILTER knobs add an effect (SHIFT: next effect)</div>
+      <div><b>Pads.</b> HOT CUE: 8 cues (SHIFT deletes) · PAD FX 1/2: hold for roll, echo, trans… · BEAT JUMP: ∓1 2 4 8 beats (SHIFT ×16) · SAMPLER: the eight sounds (SHIFT stops one)</div>
+      <div><b>SHIFT + mode.</b> KEYBOARD = stems: 1-4 on/off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all · BEAT LOOP: ¼ to 32 beats (SHIFT: loop roll while held) · KEY SHIFT: top row −2 −1 +1 +2 semitones (SHIFT −12 −7 +7 +12), bottom row match the other deck, down, up, reset</div>
+      <div>SHIFT + headphone CUE: key lock · MASTER CUE: master in phones (SHIFT: quantize) · SHIFT + BEAT ◀: effect back to 1 beat · SHIFT + BEAT ▶: effect on the master</div>
+      <div>Your own sampler sounds: put <b>1.wav</b> … <b>16.wav</b> in the <b>samples</b> folder beside Slipmat's settings and restart (pads 9-16 are deck 2's)</div>
     </div>
   </div>
 </div>

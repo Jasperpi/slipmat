@@ -92,9 +92,29 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
 - **Mixer**: trim, 3-band isolator EQ (full kill), one-knob filter, channel
   faders, crossfader with curves and A/THRU/B assign, master, headphone
   cue/master blend and level, limiter, meters.
-- **FX**: two beat-synced units (echo, reverb, flanger, phaser, roll, trans,
-  crush, wobble) on deck 1, deck 2 or the master. On the controller, PAD FX
-  modes hold-to-play effects.
+- **FX**: two beat-synced units (echo, low cut echo, ping pong, spiral,
+  reverb, flanger, phaser, roll, trans, crush, wobble) on deck 1, deck 2 or
+  the master. On the controller, PAD FX modes hold-to-play effects.
+- **Smart CFX**: the FILTER knobs add an effect on top of the filter as they
+  turn (dub echo, space, noise, crush or jet).
+- **Smart Fader**: moving from one deck to the other (crossfader or channel
+  faders) also glides the tempo from one song's to the other's and swaps
+  their basslines around the middle.
+- **Key shift and key sync**: move a song's key by semitones without
+  changing its tempo; *MATCH* shifts it the few semitones that make it fit
+  the other deck.
+- **Sampler**: sixteen one-shot pads. Eight sounds are built in (air horn,
+  siren, laser, kick, clap, snare, riser, boom); put `1.wav` … `16.wav` in
+  `~/.config/slipmat/samples/` for your own (pads 9-16 are deck 2's).
+- **Memory cues**: up to eight saved spots per song (with their loop, if
+  one was on), stepped through with CUE/LOOP CALL.
+- **Instant doubles**: press LOAD twice (or *DBL*) to put the other deck's
+  song on this one at the same spot and tempo.
+- **Loop rolls and fader start**: SHIFT + a BEAT LOOP pad loops while held,
+  then the song carries on where it would have been; SHIFT + a fader up from
+  the bottom starts its deck.
+- **History**: every song the room has heard for 20 seconds is logged
+  (*History* in the library) and marked *played* in the lists.
 - **Controller**: Pioneer DDJ-FLX4, mapped from AlphaTheta's official MIDI
   message list (`research/flx4/`), with LED feedback, channel meters, vinyl
   mode set from Settings, soft takeover on the tempo faders, hot-plugging.
@@ -104,8 +124,17 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
   analysis at low priority. Mixing uses about 1% of the time it has, even
   while a song is being split.
 - **Sound**: a DDJ is a four-channel sound card: master on 1-2 (the RCA
-  outs), headphones on 3-4. Without one, the laptop plays the master and
-  *split cue* (Settings) puts the headphone cue in the left ear.
+  outs), headphones on 3-4. Slipmat moves onto it when it is plugged in
+  (before or after starting) and back off when it is pulled out; on Linux it
+  goes through PipeWire when PipeWire runs the card. If the headphone cue
+  has no output of its own, a red bar says so (*Reconnect sound* looks
+  again). Without a controller, the laptop plays the master and *split cue*
+  (Settings) puts the headphone cue in the left ear.
+- **Hard to knock over**: a download Spotify drops is retried, the last song
+  asked for wins if several are loaded in a hurry, a deck that is playing is
+  never loaded over, a synced deck waiting at its cue stays exactly on it,
+  and the controller's lights are sent a few at a time and repeated, so one
+  lost message never leaves a light wrong.
 
 ## Controller layout (DDJ-FLX4)
 
@@ -115,31 +144,45 @@ set the DDJ-FLX4 to 4 channels (Quadraphonic) in Windows sound settings.
 | SHIFT + PLAY | censor (plays backwards, slips back on release) |
 | SHIFT + CUE | back to the start |
 | Jog top / side | scratch (vinyl mode) / nudge; SHIFT + jog searches |
-| BEAT SYNC / SHIFT + BEAT SYNC | sync / change tempo range |
+| BEAT SYNC (hold) / SHIFT + BEAT SYNC | sync on/off (hold: on) / change tempo range |
 | IN, OUT | loop in / loop out |
 | 4 BEAT/EXIT (SHIFT) | 4-beat loop, or exit the loop (back into it) |
-| CUE/LOOP CALL ◀ ▶ | halve/double the loop; without a loop, jump 4 beats |
-| SHIFT + CUE/LOOP CALL | jump 16 beats |
+| CUE/LOOP CALL ◀ ▶ | in a loop: halve/double it; else previous/next memory cue (none saved: jump 4 beats) |
+| SHIFT + CUE/LOOP CALL ◀ / ▶ | delete a memory cue / save one |
 | SHIFT + IN / OUT | halve / double the loop |
-| Pads: HOT CUE, BEAT LOOP, BEAT JUMP, PAD FX1/2 | hot cues (SHIFT deletes), auto loops, jumps, held effects |
+| HOT CUE pads | 8 hot cues (SHIFT deletes) |
+| PAD FX 1 / PAD FX 2 pads | effects while held (roll, echo, trans, wobble, reverb, flanger…) |
+| BEAT JUMP pads | ∓1, 2, 4, 8 beats (SHIFT: sixteen times as far) |
+| SAMPLER pads | the sampler's sounds: deck 1's pads 1-8, deck 2's 9-16 (SHIFT stops one) |
+| KEYBOARD pads (SHIFT + HOT CUE) | stems: 1-4 vocals/melody/bass/drums on-off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all back |
+| BEAT LOOP pads (SHIFT + BEAT JUMP) | loops of ¼ to 32 beats (SHIFT: a loop roll while held) |
+| KEY SHIFT pads (SHIFT + SAMPLER) | top row −2 −1 +1 +2 semitones (SHIFT −12 −7 +7 +12); bottom row: match the other deck, down, up, reset |
 | Headphone CUE / SHIFT + CUE | headphone cue / key lock |
-| SHIFT + HOT CUE (keyboard mode) pads | stems: 1-4 vocals/melody/bass/drums on-off (SHIFT solos), 5 acapella, 6 instrumental, 7 no drums, 8 all back |
+| CH FADER, TRIM, HI/MID/LOW | as marked |
+| SHIFT + CH FADER or crossfader | fader start: up from the bottom plays, back down returns to the cue |
+| CFX knobs / SMART CFX (SHIFT) | filter / filter + an effect (next effect) |
+| SMART FADER (SHIFT) | faders blend tempo and bass too (Auto-DJ on/off) |
 | BEAT FX section | effect unit 1: select, beat ◀ ▶, CH1/CH2/both lever, level/depth, on/off (blinks while on) |
-| MASTER LEVEL, MASTER CUE | master volume, master in the headphones |
+| SHIFT + BEAT ◀ / ▶ | effect back to one beat / effect on the master |
+| MASTER LEVEL, MASTER CUE (SHIFT) | master volume, master in the headphones (quantize on/off) |
 | HEADPHONE MIX / LEVEL | cue-to-master blend, headphone volume |
-| Browse knob, push, LOAD 1/2 | move in the list, switch playlists/songs, load |
+| Browse knob, push | move in the list, switch playlists/songs |
+| LOAD 1/2 (twice) (SHIFT) | load (instant double of the other deck) (sort the list by BPM / key) |
 | SHIFT + browse knob | zoom the waveforms |
+| MIC LEVEL | the microphone is mixed inside the controller; nothing for Slipmat to do |
 
 ## Not yet
 
-Sampler pads, key shift pads, stem effects, more than two decks, recording (Spotify
-doesn't allow recording its streams; Serato blocks it too), MIDI learn for
-other controllers.
+Effects on single stems, more than two decks (the FLX4 has two channels),
+MIDI learn for other controllers, video, DVS. Recording is left out on
+purpose: Spotify doesn't allow recording its streams, and rekordbox and
+Serato block it for streaming songs too.
 
 ## Layout
 
 - `src/engine/` the audio engine: decks (`deck.rs`), mixer and sync
-  (`mod.rs`), filters (`dsp.rs`), effects (`fx.rs`), sound card (`output.rs`)
+  (`mod.rs`), filters (`dsp.rs`), effects (`fx.rs`), sampler (`sampler.rs`),
+  sound card (`output.rs`)
 - `src/loader.rs` decodes a Spotify song into memory with librespot
 - `src/analysis.rs` tempo, grid, key, loudness
 - `src/autodj.rs` Auto-DJ: when and how to mix into the next song
@@ -151,4 +194,7 @@ other controllers.
 - `ui/` the page (plain JS modules, no build step)
 
 Build: `cargo build --release -j3`. Tests: `cargo test`.
-`SLIPMAT_NO_AUDIO=1` runs the decks without a sound card (for testing).
+`SLIPMAT_NO_AUDIO=1` runs the decks without a sound card (for testing);
+`SLIPMAT_PORT=4242` runs a second copy beside the installed one.
+`slipmat doctor --fake-ddj --name "AlphaTheta test rig" --midi "97 30 7F, wait 300, show 97 30"`
+plays a controller: sends those messages and prints lights back.

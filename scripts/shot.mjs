@@ -8,7 +8,7 @@ const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, dev
 const errors = [];
 page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') errors.push(m.text()); });
 page.on('pageerror', (e) => errors.push('PAGE: ' + e.message));
-await page.goto('http://127.0.0.1:4141/');
+await page.goto(`http://127.0.0.1:${process.env.SLIPMAT_PORT || 4141}/`);
 await page.waitForTimeout(2500);
 for (const step of steps) {
   const [cmd, ...rest] = step.split(':');
